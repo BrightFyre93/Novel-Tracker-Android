@@ -54,8 +54,11 @@ data class FilterState(
 enum class SortBy(val label: String) {
     NAME("Name"), RECENT("Recently edited"), ADDED("Recently added"), READY("Ready to read"),
     UNREAD("Unread"), PROGRESS("Progress"), LIKELY("Most likely"),
-    LAST_READ("Last read"), STALE("Stalest first"),
+    LAST_READ("Last read"), STALE("Stalest first"), REFRESH("Least recently refreshed"),
 }
+
+/** A short-lived "Undo" offered in the snackbar after a read / downloaded edit. */
+data class UndoOffer(val id: Long, val text: String)
 
 enum class ImportMode { MERGE, REPLACE }
 
@@ -86,6 +89,8 @@ private fun SortBy.comparator(): Comparator<Novel> = when (this) {
     // novels with no recorded read time go last in both orders
     SortBy.LAST_READ -> compareByDescending<Novel> { it.lastReadAt }.thenBy { it.name.lowercase() }
     SortBy.STALE -> compareBy<Novel> { if (it.lastReadAt == 0L) Long.MAX_VALUE else it.lastReadAt }.thenBy { it.name.lowercase() }
+    // linked novels first (never refreshed = oldest), novels without a site link last
+    SortBy.REFRESH -> compareBy<Novel> { if (it.slug.isBlank()) 1 else 0 }.thenBy { it.lastRefreshAt }.thenBy { it.name.lowercase() }
 }
 
 class NovelViewModel(app: Application) : AndroidViewModel(app) {
@@ -100,6 +105,31 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
     val filters = MutableStateFlow(FilterState())
     val sort = MutableStateFlow(SortBy.NAME)
     val messages = MutableSharedFlow<String>(extraBufferCapacity = 16)
+
+    // One-step undo for read-count and downloaded-through edits. Only those progress fields are restored, so a
+    // refresh or any other edit made in the meantime is not rolled back. Snapshots are kept by id so an older
+    // snackbar can never undo a newer edit.
+    val undoOffers = MutableSharedFlow<UndoOffer>(extraBufferCapacity = 8)
+    private val undoSnaps = LinkedHashMap<Long, Novel>()
+    private var undoSeq = 0L
+
+    private fun offerUndo(before: Novel, text: String) {
+        val id = ++undoSeq
+        undoSnaps[id] = before
+        while (undoSnaps.size > 8) undoSnaps.remove(undoSnaps.keys.first())
+        undoOffers.tryEmit(UndoOffer(id, text))
+    }
+
+    fun undo(id: Long) {
+        val b = undoSnaps.remove(id) ?: return
+        store.edit(b.uid) {
+            it.copy(
+                readCount = b.readCount, lastReadAt = b.lastReadAt, readingStatus = b.readingStatus,
+                downloadedThrough = b.downloadedThrough, downloadedSource = b.downloadedSource,
+            )
+        }
+        say("Undone")
+    }
     val importPlan = MutableStateFlow<ImportPlan?>(null)
     val busy = MutableStateFlow<String?>(null)
     val queue = MutableStateFlow(QueueState())
@@ -140,12 +170,20 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
     // ---------------------------------------------------------------- progress & edits
     fun update(uid: String, f: (Novel) -> Novel) = store.edit(uid, f)
 
-    fun setRead(uid: String, v: Int) = store.edit(uid) {
+    fun setRead(uid: String, v: Int) {
+        val before = novel(uid) ?: return
         val nv = v.coerceAtLeast(0)
-        if (nv == it.readCount) it else it.copy(readCount = nv, lastReadAt = System.currentTimeMillis()).afterProgress()
+        if (nv == before.readCount) return
+        store.edit(uid) { it.copy(readCount = nv, lastReadAt = System.currentTimeMillis()).afterProgress() }
+        offerUndo(before, "Read ${fmt(before.readCount)} \u2192 ${fmt(nv)}")
     }
 
-    fun setDownloaded(uid: String, v: Int) = store.edit(uid) { it.copy(downloadedThrough = v.coerceAtLeast(0), downloadedSource = "manual") }
+    fun setDownloaded(uid: String, v: Int) {
+        val before = novel(uid) ?: return
+        val nv = v.coerceAtLeast(0)
+        store.edit(uid) { it.copy(downloadedThrough = nv, downloadedSource = "manual") }
+        if (nv != before.downloadedThrough) offerUndo(before, "Downloaded ${fmt(before.downloadedThrough)} \u2192 ${fmt(nv)}")
+    }
 
     /** Typing the count yourself also settles any pending proposal. */
     fun setCurrent(uid: String, v: Int) = store.edit(uid) { it.copy(currentCount = v.coerceAtLeast(0), pendingCount = 0, pendingReason = "").afterProgress() }
@@ -155,7 +193,7 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
         val n = novel(uid) ?: return
         if (n.downloadedThrough > n.readCount) {
             store.edit(uid) { it.copy(readCount = it.downloadedThrough, lastReadAt = System.currentTimeMillis()).afterProgress() }
-            say("Read count set to ${fmt(n.downloadedThrough)}")
+            offerUndo(n, "Read count set to ${fmt(n.downloadedThrough)}")
         } else say("Nothing downloaded beyond chapter ${fmt(n.readCount)}")
     }
 

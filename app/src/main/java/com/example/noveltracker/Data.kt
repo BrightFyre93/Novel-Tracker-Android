@@ -140,6 +140,32 @@ fun appendHistory(existing: String, titles: Map<String, String>, statuses: Map<S
     return if (added) encodeHistory(list.capPerSource()) else existing
 }
 
+// ---- Freshness: how recently a novel was refreshed from its site (reads stored timestamps only, no network).
+const val STALE_DAYS = 14
+
+/** "today", "yesterday", "12 days ago", "3 months ago". */
+fun agoText(ms: Long, now: Long = System.currentTimeMillis()): String {
+    val days = ((now - ms) / 86_400_000L).coerceAtLeast(0)
+    return when {
+        days == 0L -> "today"
+        days == 1L -> "yesterday"
+        days < 60 -> "$days days ago"
+        else -> "${days / 30} months ago"
+    }
+}
+
+/** [level]: 0 = fine, 1 = stale or never refreshed, 2 = the last attempt failed. */
+data class FreshTag(val label: String, val level: Int)
+
+/** Null when the novel has no site link (nothing to refresh). */
+fun Novel.freshnessTag(now: Long = System.currentTimeMillis()): FreshTag? = when {
+    slug.isBlank() -> null
+    lastAttemptAt > lastRefreshAt -> FreshTag("Refresh failed", 2)
+    lastRefreshAt <= 0 -> FreshTag("Never refreshed", 1)
+    (now - lastRefreshAt) / 86_400_000L >= STALE_DAYS -> FreshTag("Refreshed ${agoText(lastRefreshAt, now)}", 1)
+    else -> FreshTag("Refreshed ${agoText(lastRefreshAt, now)}", 0)
+}
+
 fun Novel.ruleDownloadDefault(): Int = if (conversion && sent) currentCount else 0
 fun Novel.dismissedSet(): Set<String> = dismissed.split(";").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
 

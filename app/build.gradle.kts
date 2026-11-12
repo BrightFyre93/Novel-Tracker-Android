@@ -17,8 +17,8 @@ android {
         applicationId = "com.example.noveltracker"
         minSdk = 37
         targetSdk = 37
-        versionCode = 3
-        versionName = "3.0"
+        versionCode = 6
+        versionName = "6.0"
     }
 
     buildTypes {
@@ -50,7 +50,6 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.ktx)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     debugImplementation(libs.androidx.compose.ui.tooling)
-    implementation("org.jsoup:jsoup:1.18.3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("io.coil-kt.coil3:coil-compose:3.3.0")
     implementation("io.coil-kt.coil3:coil-network-okhttp:3.3.0")

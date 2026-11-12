@@ -47,6 +47,8 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -157,7 +159,7 @@ fun StackBar(p: Progress, height: Int = 8) {
 
 /**
  * Three-segment ring: green = read, blue = downloaded but unread, dark = not downloaded. Empty ring for zero chapters.
- * The centre shows the downloaded-through count; exact counts are shown as text next to it.
+ * The centre shows the read count; the downloaded count is shown as text on the card.
  */
 @Composable
 fun ProgressRing(p: Progress, centerText: String, modifier: Modifier = Modifier, diameter: Dp = 56.dp, strokeWidth: Dp = 6.dp) {
@@ -213,8 +215,8 @@ fun Choice(label: String, options: List<String>, value: String, onPick: (String)
 
 // ------------------------------------------------------------------ dialogs
 /**
- * Whole-number editor. Blank/invalid input can't be saved; a value above [warnAbove] (when > 0) needs a second,
- * explicit tap ("Save anyway") instead of being silently accepted or clamped. Input is kept until the dialog closes.
+ * Whole-number editor. Blank/invalid input can't be saved. A value above [warnAbove] or below [warnBelow] (when > 0)
+ * shows a warning as soon as it is typed and the button becomes "Save anyway", so it is never silently accepted or clamped.
  */
 @Composable
 fun NumberDialog(
@@ -223,7 +225,6 @@ fun NumberDialog(
     warnBelow: Int = 0, warnBelowText: String = "", onSave: (Int) -> Unit,
 ) {
     var t by remember { mutableStateOf(initial.toString()) }
-    var confirming by remember { mutableStateOf(false) }
     var submitted by remember { mutableStateOf(false) }
     val v = t.toIntOrNull()
     val tooHigh = v != null && warnAbove > 0 && v > warnAbove
@@ -235,20 +236,19 @@ fun NumberDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
-                    value = t, onValueChange = { t = it.filter(Char::isDigit); confirming = false }, singleLine = true,
-                    isError = v == null || (over && confirming),
+                    value = t, onValueChange = { t = it.filter(Char::isDigit) }, singleLine = true,
+                    isError = v == null || over,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 )
                 if (v == null) Text("Enter a whole number", style = MaterialTheme.typography.bodySmall, color = Pal.Red)
-                else if (over && confirming) Text(message, style = MaterialTheme.typography.bodySmall, color = Pal.Yellow)
+                else if (over) Text(message, style = MaterialTheme.typography.bodySmall, color = Pal.Yellow)
             }
         },
         confirmButton = {
             TextButton(enabled = v != null && !submitted, onClick = {
                 if (v == null) return@TextButton
-                if (over && !confirming) confirming = true
-                else { submitted = true; onSave(v); onDismiss() }
-            }) { Text(if (over && confirming) "Save anyway" else "Save") }
+                submitted = true; onSave(v); onDismiss()
+            }) { Text(if (over) "Save anyway" else "Save") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
@@ -257,7 +257,6 @@ fun NumberDialog(
 @Composable
 fun ProgressDialog(n: Novel, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
     var t by remember { mutableStateOf(n.readCount.toString()) }
-    var confirming by remember { mutableStateOf(false) }
     var submitted by remember { mutableStateOf(false) }
     val v = t.toIntOrNull()
     val cur = v ?: 0
@@ -269,34 +268,33 @@ fun ProgressDialog(n: Novel, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(
-                    value = t, onValueChange = { t = it.filter(Char::isDigit); confirming = false }, singleLine = true,
+                    value = t, onValueChange = { t = it.filter(Char::isDigit) }, singleLine = true,
                     label = { Text("Chapters read") },
-                    isError = v == null || (over && confirming),
+                    isError = v == null || over,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 )
                 if (v == null) Text("Enter a whole number", style = MaterialTheme.typography.bodySmall, color = Pal.Red)
-                else if (over && confirming) Text(
-                    "Chapter ${fmt(v)} is past the latest known chapter (${fmt(n.currentCount)}). Save anyway?",
+                else if (over) Text(
+                    "Chapter ${fmt(v)} is past the latest known chapter (${fmt(n.currentCount)}). You can still save it.",
                     style = MaterialTheme.typography.bodySmall, color = Pal.Yellow,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(1, 10, 50).forEach { d -> AssistChip(onClick = { t = (cur + d).toString(); confirming = false }, label = { Text("+$d") }) }
+                    listOf(1, 10, 50).forEach { d -> AssistChip(onClick = { t = (cur + d).toString() }, label = { Text("+$d") }) }
                 }
                 Text(
                     "Downloaded through ${fmt(n.downloadedThrough)}  ·  latest ${fmt(n.currentCount)}",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 if (n.downloadedThrough > cur) {
-                    OutlinedButton(onClick = { t = n.downloadedThrough.toString(); confirming = false }) { Text("Set to downloaded (${fmt(n.downloadedThrough)})") }
+                    OutlinedButton(onClick = { t = n.downloadedThrough.toString() }) { Text("Set to downloaded (${fmt(n.downloadedThrough)})") }
                 }
             }
         },
         confirmButton = {
             TextButton(enabled = v != null && !submitted, onClick = {
                 if (v == null) return@TextButton
-                if (over && !confirming) confirming = true
-                else { submitted = true; onSave(v); onDismiss() }
-            }) { Text(if (over && confirming) "Save anyway" else "Save") }
+                submitted = true; onSave(v); onDismiss()
+            }) { Text(if (over) "Save anyway" else "Save") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
@@ -361,6 +359,13 @@ fun App(vm: NovelViewModel) {
     val snack = remember { SnackbarHostState() }
     val saveError by vm.saveError.collectAsState()
     LaunchedEffect(Unit) { vm.messages.collect { snack.showSnackbar(it) } }
+    // Undo offers share the same snackbar host (shown one after another); tapping Undo restores the old progress.
+    LaunchedEffect(Unit) {
+        vm.undoOffers.collect { o ->
+            val r = snack.showSnackbar(o.text, actionLabel = "Undo", duration = SnackbarDuration.Long)
+            if (r == SnackbarResult.ActionPerformed) vm.undo(o.id)
+        }
+    }
     BackHandler(enabled = screen != "lib") {
         screen = when (screen) { "verify" -> verifyBack; "detail" -> detailBack; else -> "lib" }
     }
@@ -575,27 +580,28 @@ fun NovelCard(n: Novel, warn: Boolean, onOpen: () -> Unit, onProgress: () -> Uni
     Card(onClick = onOpen, shape = RoundedCornerShape(12.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Cover(n.coverUrl, Modifier.width(56.dp).height(84.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(n.name, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    ProgressRing(n.progress(), centerText = fmt(n.downloadedThrough))
-                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text("${fmt(n.readCount)} / ${fmt(n.currentCount)} read", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        if (n.readyToRead > 0) Text("${fmt(n.readyToRead)} ready", style = MaterialTheme.typography.bodySmall, color = Pal.Blue)
-                        else if (n.toDownload > 0 && n.likely != "No") Text("${fmt(n.toDownload)} to download", style = MaterialTheme.typography.bodySmall, color = Pal.Yellow)
-                    }
+                Text("${fmt(n.readCount)} / ${fmt(n.currentCount)} read", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Downloaded ${fmt(n.downloadedThrough)}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (n.readyToRead > 0) Text("· ${fmt(n.readyToRead)} ready", style = MaterialTheme.typography.bodySmall, color = Pal.Blue)
+                    else if (n.toDownload > 0 && n.likely != "No") Text("· ${fmt(n.toDownload)} to download", style = MaterialTheme.typography.bodySmall, color = Pal.Yellow)
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    FlowRow(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Tag(n.readingStatus, statusColor(n.readingStatus))
-                        Tag(n.novelStatus, statusColor(n.novelStatus))
-                        Tag("Likely ${n.likely}", statusColor(n.likely))
-                        if (n.pendingCount > 0) Tag("Review count", Pal.Yellow)
-                        if (warn) Tag("Check", Pal.Red)
-                        if (n.manualChapters) Tag("Manual", Color.Gray)
-                    }
-                    TextButton(onClick = onProgress) { Text("Update") }
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Tag(n.readingStatus, statusColor(n.readingStatus))
+                    Tag(n.novelStatus, statusColor(n.novelStatus))
+                    Tag("Likely ${n.likely}", statusColor(n.likely))
+                    if (n.pendingCount > 0) Tag("Review count", Pal.Yellow)
+                    if (warn) Tag("Check", Pal.Red)
+                    if (n.manualChapters) Tag("Manual", Color.Gray)
+                    n.freshnessTag()?.let { f -> Tag(f.label, when (f.level) { 2 -> Pal.Red; 1 -> Pal.Yellow; else -> Color.Gray }) }
                 }
+            }
+            // Ring above Update fills the right-hand side, so the card has no empty corner.
+            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                ProgressRing(n.progress(), centerText = fmt(n.readCount))
+                TextButton(onClick = onProgress) { Text("Update") }
             }
         }
     }
@@ -616,6 +622,7 @@ fun DetailScreen(vm: NovelViewModel, uid: String, onBack: () -> Unit, onVerify: 
     var progress by remember { mutableStateOf(false) }
     var editNum by remember { mutableStateOf<String?>(null) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var showHistory by remember { mutableStateOf(false) }
     var remarks by remember(n.uid) { mutableStateOf(n.remarks) }
     var link by remember(n.uid) { mutableStateOf(n.slug) }
     var expanded by remember { mutableStateOf(false) }
@@ -743,13 +750,27 @@ fun DetailScreen(vm: NovelViewModel, uid: String, onBack: () -> Unit, onVerify: 
             Text(
                 buildString {
                     append("Last read: ${whenText(n.lastReadAt)}")
-                    append("\nLast successful refresh: ${whenText(n.lastRefreshAt)}")
+                    append("\nLast successful refresh: ${whenText(n.lastRefreshAt)}${if (n.lastRefreshAt > 0) " (${agoText(n.lastRefreshAt)})" else ""}")
                     if (n.lastAttemptAt > n.lastRefreshAt) append("\nLast attempt (failed): ${whenText(n.lastAttemptAt)}")
                     if (counts.isNotEmpty()) append("\nSite counts: " + counts.entries.joinToString("  ") { "${sourceLabel(it.key)} ${fmt(it.value)}" })
                     if (n.scrapeNote.isNotBlank()) append("\n${n.scrapeNote}")
                 },
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // Scrape History (diagnostic): newest first, one line per observation.
+            val history = remember(n.scrapeHistory) { parseHistory(n.scrapeHistory).first }
+            if (history.isNotEmpty()) {
+                TextButton(onClick = { showHistory = !showHistory }) { Text(if (showHistory) "Hide scrape history" else "Scrape history (${history.size})") }
+                if (showHistory) Text(
+                    history.joinToString("\n") { e ->
+                        val outcome = when (e.outcome) {
+                            "APPLIED" -> "count updated"; "PENDING" -> "needs review"; "MANUAL" -> "manual novel, count skipped"; else -> "no change"
+                        }
+                        "${whenText(e.at)} · ${sourceLabel(e.source)} · ${fmt(e.count)} ch · ${e.siteStatus.ifBlank { "status n/a" }} · $outcome"
+                    },
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 
