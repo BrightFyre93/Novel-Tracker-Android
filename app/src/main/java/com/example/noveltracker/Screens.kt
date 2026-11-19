@@ -10,14 +10,19 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -45,6 +50,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
 // ------------------------------------------------------------------ import preview
@@ -269,6 +275,57 @@ fun ChecksScreen(vm: NovelViewModel, onBack: () -> Unit, onOpen: (String) -> Uni
                 }
             }
             if (codes.isEmpty()) item { Text("No data problems found.", modifier = Modifier.padding(top = 16.dp)) }
+        }
+    }
+}
+
+/**
+ * Reading queue: novels you lined up to read next, in the order you chose. Eligibility (chapters ready) is only
+ * shown, it never changes the order; opening, moving or removing never touches progress or status.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ReadingQueueScreen(vm: NovelViewModel, onBack: () -> Unit, onOpen: (String) -> Unit) {
+    val q by vm.readingQueue.collectAsState()
+    val nextUid = remember(q) { q.firstOrNull { it.isNextEligible }?.uid }
+    Scaffold(
+        containerColor = Color.Transparent,
+        topBar = {
+            TopAppBar(
+                title = { Text("Reading queue") },
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } },
+            )
+        },
+    ) { pad ->
+        if (q.isEmpty()) {
+            Text(
+                "Nothing queued yet. Open a novel and tap Queue in the top bar.",
+                modifier = Modifier.padding(pad).padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            return@Scaffold
+        }
+        LazyColumn(Modifier.padding(pad), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            item {
+                Button(onClick = { vm.nextToRead()?.let { onOpen(it.uid) } }, modifier = Modifier.fillMaxWidth()) { Text("Next to read") }
+            }
+            itemsIndexed(q, key = { _, n -> n.uid }) { i, n ->
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                    Row(Modifier.fillMaxWidth().padding(start = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("${i + 1}", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(28.dp))
+                        Column(Modifier.weight(1f).clickable { onOpen(n.uid) }.defaultMinSize(minHeight = 48.dp).padding(vertical = 8.dp)) {
+                            Text(n.name, style = MaterialTheme.typography.titleSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            when {
+                                n.readingStatus == "Completed" -> Text("Completed", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                n.readyToRead > 0 -> Text("${fmt(n.readyToRead)} ready to read${if (n.uid == nextUid) " \u00b7 next up" else ""}", style = MaterialTheme.typography.bodySmall, color = Pal.Blue)
+                                else -> Text("Nothing downloaded to read yet", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        IconButton(enabled = i > 0, onClick = { vm.moveInReadingQueue(n.uid, -1) }) { Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Move up") }
+                        IconButton(enabled = i < q.lastIndex, onClick = { vm.moveInReadingQueue(n.uid, 1) }) { Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Move down") }
+                        IconButton(onClick = { vm.removeFromReadingQueue(n.uid) }) { Icon(Icons.Default.Close, contentDescription = "Remove from queue") }
+                    }
+                }
+            }
         }
     }
 }

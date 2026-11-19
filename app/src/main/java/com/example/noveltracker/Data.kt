@@ -56,6 +56,8 @@ data class Novel(
     val scrapeNote: String = "",
     /** Bounded log of successful scrape observations, newest first (see [parseHistory]). Diagnostic only. */
     val scrapeHistory: String = "",
+    /** Reading queue order chosen by the user: 1..n, 0 = not queued. */
+    val queuePos: Int = 0,
     /** Validation codes you've acknowledged, ';'-separated. */
     val dismissed: String = "",
     val lastReadAt: Long = 0,
@@ -75,6 +77,12 @@ val Novel.toDownload: Int get() = (currentCount - downloadedThrough).coerceAtLea
 val Novel.isReadyToRead: Boolean get() = readyToRead > 0
 val Novel.needsDownload: Boolean get() = likely != "No" && toDownload > 0 && readingStatus != "Aborted"
 val Novel.needsReview: Boolean get() = pendingCount > 0
+
+/** Read chapters have reached the latest chapter count. Independent of the novel's status (running or completed). */
+val Novel.isCaughtUp: Boolean get() = currentCount > 0 && readCount >= currentCount
+
+/** A queued novel that "Next to read" may pick: chapters ready, and not Completed or Aborted. */
+val Novel.isNextEligible: Boolean get() = isReadyToRead && readingStatus != "Completed" && readingStatus != "Aborted"
 
 /** How the chapters split for display. Stored values are never changed to make this look consistent. */
 data class Progress(val total: Int, val read: Int, val downloadedUnread: Int, val notDownloaded: Int)
@@ -166,6 +174,13 @@ fun Novel.freshnessTag(now: Long = System.currentTimeMillis()): FreshTag? = when
     else -> FreshTag("Refreshed ${agoText(lastRefreshAt, now)}", 0)
 }
 
+/** The novel's genres as a set of lower-case names. The text may use ';' (scraped) or ',' (spreadsheet) between genres. */
+fun Novel.genreSet(): Set<String> =
+    genres.split(';', ',').map { it.trim().lowercase() }.filter { it.isNotEmpty() }.toSet()
+
+/** "sci-fi action" -> "Sci-fi Action" */
+fun titleCase(s: String): String = s.split(' ').joinToString(" ") { w -> w.replaceFirstChar { it.uppercaseChar() } }
+
 fun Novel.ruleDownloadDefault(): Int = if (conversion && sent) currentCount else 0
 fun Novel.dismissedSet(): Set<String> = dismissed.split(";").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
 
@@ -221,6 +236,14 @@ fun slugFrom(input: String): String {
     val t = input.trim().substringBefore('?').substringBefore('#').trimEnd('/')
     return t.substringAfterLast('/').removeSuffix(".html")
 }
+
+/** "Gamer Reborn" -> "gamer-reborn": a best guess at the site's page name when no link is given. */
+fun slugFromName(name: String): String =
+    name.lowercase().replace("'", "").replace("\u2019", "").replace(Regex("[^a-z0-9]+"), "-").trim('-')
+
+/** Which mirror a pasted link points at ("com" or "net"), or "" for a bare slug or an unknown site. */
+fun siteFromLink(input: String): String =
+    BASES.entries.firstOrNull { (_, base) -> input.contains(base.removePrefix("https://"), ignoreCase = true) }?.key.orEmpty()
 
 /** After the read count changes, keep Status of Reading sensible. */
 fun Novel.afterProgress(): Novel {

@@ -3,6 +3,7 @@ package com.example.noveltracker
 import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
@@ -18,6 +19,28 @@ import java.nio.file.StandardCopyOption
  * so there is no database to migrate and the file can later be shared with a Windows companion app.
  */
 class NovelStore(private val ctx: Context, scope: CoroutineScope) {
+    companion object {
+        @Volatile private var instance: NovelStore? = null
+
+        /**
+         * The one store for the whole process. The screens and the background refresh worker both use it, so there is
+         * only ever one writer of novels.csv (two separate copies would overwrite each other's changes).
+         */
+        fun get(ctx: Context): NovelStore = instance ?: synchronized(this) {
+            instance ?: NovelStore(ctx.applicationContext, CoroutineScope(SupervisorJob() + Dispatchers.Default)).also { instance = it }
+        }
+    }
+
+    private var loaded = false
+    private var hadFile = false
+
+    /** Loads novels.csv once per process. @return true if a saved library existed. */
+    @Synchronized
+    fun ensureLoaded(): Boolean {
+        if (!loaded) { hadFile = load(); loaded = true }
+        return hadFile
+    }
+
     private val file = File(ctx.filesDir, "novels.csv")
     val novels = MutableStateFlow<List<Novel>>(emptyList())
 
@@ -56,11 +79,30 @@ class NovelStore(private val ctx: Context, scope: CoroutineScope) {
     /** Asks for another save of the current in-memory library (used by the Retry button). */
     fun retrySave() { saveSignal.trySend(Unit) }
 
-    /** @return true if a saved library existed. */
+    /** Set when the saved library could not be read at startup; the screens show it once. */
+    var loadNotice: String? = null
+        private set
+
+    /**
+     * Reads novels.csv. It only becomes the backup (novels.bak.csv) after it has been read successfully, so a damaged
+     * file can no longer overwrite the good backup. If it can't be read, the backup is loaded instead and the bad file
+     * is kept as novels.corrupt.csv.
+     * @return true if a saved library existed.
+     */
     fun load(): Boolean {
         if (!file.exists()) return false
-        runCatching { file.copyTo(File(ctx.filesDir, "novels.bak.csv"), overwrite = true) }
-        novels.value = Csv.toNovels(Csv.parse(Csv.decode(file.readBytes()))).novels
+        val bak = File(ctx.filesDir, "novels.bak.csv")
+        val parsed = runCatching { Csv.toNovels(Csv.parse(Csv.decode(file.readBytes()))).novels }
+        if (parsed.isSuccess) {
+            runCatching { file.copyTo(bak, overwrite = true) }
+            novels.value = parsed.getOrThrow()
+            return true
+        }
+        runCatching { file.copyTo(File(ctx.filesDir, "novels.corrupt.csv"), overwrite = true) }
+        val fromBackup = if (bak.exists()) runCatching { Csv.toNovels(Csv.parse(Csv.decode(bak.readBytes()))).novels }.getOrNull() else null
+        novels.value = fromBackup ?: emptyList()
+        loadNotice = if (fromBackup != null) "novels.csv could not be read, so the last backup was loaded (the unreadable file is kept as novels.corrupt.csv)"
+        else "novels.csv could not be read and there is no usable backup (the unreadable file is kept as novels.corrupt.csv)"
         return true
     }
 

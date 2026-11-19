@@ -9,7 +9,10 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,6 +24,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -40,7 +44,10 @@ import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Refresh
@@ -81,6 +88,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -91,14 +99,19 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 
 // ------------------------------------------------------------------ theme
 /** Colours follow your Excel rules: green = done/yes, blue = running, yellow = not started/maybe, red = no/aborted. */
@@ -213,6 +226,15 @@ fun ChoiceKV(label: String, options: List<Pair<String, String>>, value: String, 
 fun Choice(label: String, options: List<String>, value: String, onPick: (String) -> Unit) =
     ChoiceKV(label, options.map { it to it }, value, onPick)
 
+/** Keeps digits and the first '.', so typing 101.1 stays 101.1 instead of turning into 1011. */
+private fun cleanNumberInput(s: String): String {
+    val dot = s.indexOf('.')
+    return if (dot < 0) s.filter(Char::isDigit) else s.substring(0, dot).filter(Char::isDigit) + "." + s.substring(dot + 1).filter(Char::isDigit)
+}
+
+/** The whole chapter number of typed text: "101.1" -> 101 (the part after the point is dropped, never joined on). */
+private fun wholeOf(s: String): Int? = s.substringBefore('.').toIntOrNull()
+
 // ------------------------------------------------------------------ dialogs
 /**
  * Whole-number editor. Blank/invalid input can't be saved. A value above [warnAbove] or below [warnBelow] (when > 0)
@@ -226,7 +248,7 @@ fun NumberDialog(
 ) {
     var t by remember { mutableStateOf(initial.toString()) }
     var submitted by remember { mutableStateOf(false) }
-    val v = t.toIntOrNull()
+    val v = wholeOf(t)
     val tooHigh = v != null && warnAbove > 0 && v > warnAbove
     val tooLow = v != null && warnBelow > 0 && v < warnBelow
     val over = tooHigh || tooLow
@@ -236,12 +258,13 @@ fun NumberDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
-                    value = t, onValueChange = { t = it.filter(Char::isDigit) }, singleLine = true,
+                    value = t, onValueChange = { t = cleanNumberInput(it) }, singleLine = true,
                     isError = v == null || over,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 )
                 if (v == null) Text("Enter a whole number", style = MaterialTheme.typography.bodySmall, color = Pal.Red)
                 else if (over) Text(message, style = MaterialTheme.typography.bodySmall, color = Pal.Yellow)
+                if (v != null && '.' in t) Text("Counted as chapter ${fmt(v)} (the part after the point is dropped)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         },
         confirmButton = {
@@ -258,7 +281,7 @@ fun NumberDialog(
 fun ProgressDialog(n: Novel, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
     var t by remember { mutableStateOf(n.readCount.toString()) }
     var submitted by remember { mutableStateOf(false) }
-    val v = t.toIntOrNull()
+    val v = wholeOf(t)
     val cur = v ?: 0
     // A read count past the latest known chapter is possible (site count may be stale) but must be confirmed.
     val over = v != null && n.currentCount > 0 && v > n.currentCount
@@ -268,16 +291,17 @@ fun ProgressDialog(n: Novel, onDismiss: () -> Unit, onSave: (Int) -> Unit) {
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(
-                    value = t, onValueChange = { t = it.filter(Char::isDigit) }, singleLine = true,
+                    value = t, onValueChange = { t = cleanNumberInput(it) }, singleLine = true,
                     label = { Text("Chapters read") },
                     isError = v == null || over,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 )
                 if (v == null) Text("Enter a whole number", style = MaterialTheme.typography.bodySmall, color = Pal.Red)
                 else if (over) Text(
                     "Chapter ${fmt(v)} is past the latest known chapter (${fmt(n.currentCount)}). You can still save it.",
                     style = MaterialTheme.typography.bodySmall, color = Pal.Yellow,
                 )
+                if (v != null && '.' in t) Text("Counted as chapter ${fmt(v)} (the part after the point is dropped)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(1, 10, 50).forEach { d -> AssistChip(onClick = { t = (cur + d).toString() }, label = { Text("+$d") }) }
                 }
@@ -312,7 +336,7 @@ fun AddDialog(onDismiss: () -> Unit, onAdd: (String, String) -> Unit) {
                 OutlinedTextField(
                     link, { link = it }, label = { Text("Link (optional)") }, singleLine = true,
                     placeholder = { Text("spirit-realm.html") },
-                    supportingText = { Text("Filled from the site automatically when a link is given") },
+                    supportingText = { Text(if (link.isBlank()) "Empty: I'll try \"${slugFromName(name)}\" on both sites" else "Filled from the site automatically") },
                 )
             }
         },
@@ -322,8 +346,9 @@ fun AddDialog(onDismiss: () -> Unit, onAdd: (String, String) -> Unit) {
 }
 
 @Composable
-fun RefreshAllDialog(all: List<Novel>, onDismiss: () -> Unit, onStart: (Boolean) -> Unit) {
+fun RefreshAllDialog(all: List<Novel>, onDismiss: () -> Unit, onStart: (skip: Boolean, background: Boolean) -> Unit) {
     var skip by remember { mutableStateOf(true) }
+    var background by remember { mutableStateOf(false) }
     val linked = all.filter { it.slug.isNotBlank() }
     val pages = linked.sumOf { n -> n.sites.split(",").count { it.trim() in BASES }.let { if (it == 0) BASES.size else it } }
     val minutes = (pages * 4 / 60).coerceAtLeast(1)
@@ -340,9 +365,13 @@ fun RefreshAllDialog(all: List<Novel>, onDismiss: () -> Unit, onStart: (Boolean)
                     Checkbox(checked = skip, onCheckedChange = { skip = it })
                     Text("Skip novels already refreshed today", Modifier.clickable { skip = !skip }.padding(vertical = 12.dp))
                 }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = background, onCheckedChange = { background = it })
+                    Text("Keep going in the background (needs a connection; a bot check pauses it)", Modifier.clickable { background = !background }.padding(vertical = 12.dp))
+                }
             }
         },
-        confirmButton = { TextButton(onClick = { onStart(skip); onDismiss() }) { Text("Start") } },
+        confirmButton = { TextButton(onClick = { onStart(skip, background); onDismiss() }) { Text("Start") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
@@ -358,11 +387,13 @@ fun App(vm: NovelViewModel) {
     var verifyBack by rememberSaveable { mutableStateOf("lib") }
     val snack = remember { SnackbarHostState() }
     val saveError by vm.saveError.collectAsState()
-    LaunchedEffect(Unit) { vm.messages.collect { snack.showSnackbar(it) } }
+    LaunchedEffect(Unit) { vm.messages.collect { snack.showTimed(it, 4_000) } }
+    // Tell the user once if the saved library was unreadable and the backup was used instead.
+    LaunchedEffect(Unit) { vm.startupNotice()?.let { snack.showTimed(it, 8_000) } }
     // Undo offers share the same snackbar host (shown one after another); tapping Undo restores the old progress.
     LaunchedEffect(Unit) {
         vm.undoOffers.collect { o ->
-            val r = snack.showSnackbar(o.text, actionLabel = "Undo", duration = SnackbarDuration.Long)
+            val r = snack.showTimed(o.text, 6_000, actionLabel = "Undo", replace = true)
             if (r == SnackbarResult.ActionPerformed) vm.undo(o.id)
         }
     }
@@ -375,11 +406,14 @@ fun App(vm: NovelViewModel) {
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Box(Modifier.fillMaxSize()) {
             when (screen) {
-                "detail" -> DetailScreen(vm, openUid, onBack = { screen = detailBack }, onVerify = verifyFrom("detail"))
+                "detail" -> key(openUid) {
+                    DetailScreen(vm, openUid, onBack = { screen = detailBack }, onVerify = verifyFrom("detail"), onOpen = { openUid = it }, useQueue = detailBack == "readq")
+                }
                 "verify" -> VerifyScreen(onDone = { screen = verifyBack })
                 "review" -> ReviewScreen(vm, onBack = { screen = "lib" }, onOpen = openFrom("review"))
                 "queue" -> QueueScreen(vm, onBack = { screen = "lib" }, onOpen = openFrom("queue"), onVerify = verifyFrom("queue"))
                 "checks" -> ChecksScreen(vm, onBack = { screen = "lib" }, onOpen = openFrom("checks"))
+                "readq" -> ReadingQueueScreen(vm, onBack = { screen = "lib" }, onOpen = openFrom("readq"))
                 else -> LibraryScreen(vm, listState = libraryList, onOpen = openFrom("lib"), go = { screen = it }, onVerify = verifyFrom("lib"))
             }
             SnackbarHost(snack, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 72.dp))
@@ -401,6 +435,117 @@ fun App(vm: NovelViewModel) {
             }
         }
     }
+}
+
+/** Pick one field and a value, then confirm: the change is applied to every selected novel. */
+@Composable
+fun BulkEditDialog(count: Int, onDismiss: () -> Unit, onApply: (BulkField, String) -> Unit) {
+    var field by remember { mutableStateOf(BulkField.LIKELY_TO_READ) }
+    var value by remember { mutableStateOf<String?>(null) }
+    var confirming by remember { mutableStateOf(false) }
+    val plural = if (count == 1) "" else "s"
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (confirming) "Confirm change" else "Edit $count novel$plural") },
+        text = {
+            if (confirming) Text("Set ${field.label} to \"$value\" on $count novel$plural?")
+            else Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                ChoiceKV("Field", BulkField.entries.map { it.name to it.label }, field.name) { field = BulkField.valueOf(it); value = null }
+                Choice(field.label, field.options, value ?: "") { value = it }
+            }
+        },
+        confirmButton = {
+            val v = value
+            TextButton(enabled = v != null, onClick = { if (!confirming) confirming = true else if (v != null) onApply(field, v) }) {
+                Text(if (confirming) "Apply" else "Next")
+            }
+        },
+        dismissButton = { TextButton(onClick = { if (confirming) confirming = false else onDismiss() }) { Text(if (confirming) "Back" else "Cancel") } },
+    )
+}
+
+/**
+ * Shows a snackbar that has a ✕ to close it and goes away by itself after [millis]. With [replace] it takes the place of
+ * whatever is showing (a newer Undo supersedes an older one) instead of queueing behind it.
+ */
+private suspend fun SnackbarHostState.showTimed(text: String, millis: Long, actionLabel: String? = null, replace: Boolean = false): SnackbarResult {
+    if (replace) currentSnackbarData?.dismiss()
+    return coroutineScope {
+        // Start timing only once this snackbar is the one on screen (it may be queued behind another), then close it.
+        val timer = launch {
+            while (currentSnackbarData?.visuals?.message != text) delay(100)
+            delay(millis)
+            if (currentSnackbarData?.visuals?.message == text) currentSnackbarData?.dismiss()
+        }
+        try {
+            showSnackbar(text, actionLabel, withDismissAction = true, duration = SnackbarDuration.Indefinite)
+        } finally {
+            timer.cancel()
+        }
+    }
+}
+
+/**
+ * Add several novels at once: paste one name or link per line. While it runs the dialog shows progress and a Stop
+ * button; at the end it lists what was added, skipped and what needs attention.
+ */
+@Composable
+fun AddSeveralDialog(state: BulkAddState, onStart: (String) -> Unit, onStop: () -> Unit, onDone: () -> Unit) {
+    var text by rememberSaveable { mutableStateOf("") }
+    val idle = !state.running && !state.finished
+    AlertDialog(
+        onDismissRequest = { if (idle) onDone() },
+        title = { Text(if (state.running) "Adding\u2026" else if (state.finished) "Done" else "Add several novels") },
+        text = {
+            when {
+                state.running -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("${minOf(state.done + 1, state.total)} of ${state.total}: ${state.current}")
+                    LinearProgressIndicator(progress = { state.done / state.total.coerceAtLeast(1).toFloat() }, modifier = Modifier.fillMaxWidth())
+                    Text("Needs a connection. A bot check stops it.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                state.finished -> Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    state.report.forEachIndexed { i, line ->
+                        Text(line, style = if (i == 0) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
+                            color = if (i == 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                else -> OutlinedTextField(
+                    value = text, onValueChange = { text = it }, label = { Text("One name or link per line") },
+                    minLines = 6, maxLines = 10, modifier = Modifier.fillMaxWidth(),
+                    supportingText = { Text("A link fills in the name and details from the site. A name is looked up on both sites. Lines already in your library are skipped.") },
+                )
+            }
+        },
+        confirmButton = {
+            when {
+                state.running -> TextButton(onClick = onStop) { Text("Stop") }
+                state.finished -> TextButton(onClick = onDone) { Text("Done") }
+                else -> TextButton(enabled = text.isNotBlank(), onClick = { onStart(text) }) { Text("Add") }
+            }
+        },
+        dismissButton = { if (idle) TextButton(onClick = onDone) { Text("Cancel") } },
+    )
+}
+
+/** Change a novel's title. Empty titles and titles another novel already has are refused, with the reason shown. */
+@Composable
+fun RenameDialog(current: String, problem: (String) -> String?, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var t by remember { mutableStateOf(current) }
+    val trimmed = t.trim()
+    val changed = trimmed != current
+    val issue = if (changed || trimmed.isEmpty()) problem(trimmed) else null
+    AlertDialog(
+        onDismissRequest = onDismiss, title = { Text("Rename") },
+        text = {
+            OutlinedTextField(
+                value = t, onValueChange = { t = it.replace("\n", " ") }, singleLine = true, label = { Text("Title") },
+                isError = issue != null, supportingText = { if (issue != null) Text(issue) },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = { TextButton(enabled = changed && issue == null, onClick = { onSave(trimmed); onDismiss() }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 // ------------------------------------------------------------------ filters
@@ -426,9 +571,11 @@ fun MultiChoice(label: String, options: List<String>, selected: Set<String>, onT
  * Top row: Filters (opens the panel), quick toggles that drive the same filter state, a removable chip per other
  * active filter, and Clear all. State lives in the ViewModel, so it survives opening a novel and coming back.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun FilterBar(vm: NovelViewModel) {
     val f by vm.filters.collectAsState()
+    val genreOpts by vm.genreOptions.collectAsState()
     var open by rememberSaveable { mutableStateOf(false) }
     fun set(g: (FilterState) -> FilterState) = vm.filters.update(g)
     Column {
@@ -439,6 +586,14 @@ fun FilterBar(vm: NovelViewModel) {
             FilterChip(selected = open, onClick = { open = !open }, label = { Text(if (f.isDefault) "Filters" else "Filters (${f.activeCount})") })
             FilterChip(selected = f.ready, onClick = { set { it.copy(ready = !it.ready) } }, label = { Text("Ready to read") })
             FilterChip(
+                selected = f.converted == Tri.YES, label = { Text("Converted") },
+                onClick = { set { it.copy(converted = if (it.converted == Tri.YES) Tri.ALL else Tri.YES) } },
+            )
+            FilterChip(
+                selected = f.sent == Tri.YES, label = { Text("Sent") },
+                onClick = { set { it.copy(sent = if (it.sent == Tri.YES) Tri.ALL else Tri.YES) } },
+            )
+            FilterChip(
                 selected = f.download == Tri.YES, label = { Text("Needs download") },
                 onClick = { set { it.copy(download = if (it.download == Tri.YES) Tri.ALL else Tri.YES) } },
             )
@@ -446,20 +601,47 @@ fun FilterBar(vm: NovelViewModel) {
                 selected = f.review == Tri.YES, label = { Text("Needs review") },
                 onClick = { set { it.copy(review = if (it.review == Tri.YES) Tri.ALL else Tri.YES) } },
             )
+            FilterChip(
+                selected = f.caughtUp == Tri.YES, label = { Text("Caught up") },
+                onClick = { set { it.copy(caughtUp = if (it.caughtUp == Tri.YES) Tri.ALL else Tri.YES) } },
+            )
             f.reading.forEach { v -> RemovableChip("Reading: $v") { set { it.copy(reading = it.reading - v) } } }
             f.novel.forEach { v -> RemovableChip("Novel: $v") { set { it.copy(novel = it.novel - v) } } }
             f.likely.forEach { v -> RemovableChip("Likely: $v") { set { it.copy(likely = it.likely - v) } } }
+            f.genres.forEach { g -> RemovableChip("Genre: ${titleCase(g)}") { set { it.copy(genres = it.genres - g) } } }
+            if (f.converted == Tri.NO) RemovableChip("Converted: No") { set { it.copy(converted = Tri.ALL) } }
+            if (f.sent == Tri.NO) RemovableChip("Sent: No") { set { it.copy(sent = Tri.ALL) } }
             if (f.download == Tri.NO) RemovableChip("Needs download: No") { set { it.copy(download = Tri.ALL) } }
             if (f.review == Tri.NO) RemovableChip("Needs review: No") { set { it.copy(review = Tri.ALL) } }
+            if (f.caughtUp == Tri.NO) RemovableChip("Caught up: No") { set { it.copy(caughtUp = Tri.ALL) } }
             if (!f.isDefault) TextButton(onClick = { vm.clearFilters() }) { Text("Clear all") }
         }
         if (open) {
-            Column(Modifier.padding(horizontal = 12.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            // Back closes the panel first (instead of leaving the app). The panel is at most half the screen and scrolls.
+            BackHandler { open = false }
+            val maxPanel = (LocalConfiguration.current.screenHeightDp / 2).dp
+            Column(
+                Modifier.heightIn(max = maxPanel).verticalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 MultiChoice("Reading status", READING, f.reading) { v -> set { it.copy(reading = it.reading.toggled(v)) } }
                 MultiChoice("Novel status", NOVEL_STATUS, f.novel) { v -> set { it.copy(novel = it.novel.toggled(v)) } }
                 MultiChoice("Likely to read", LIKELY, f.likely) { v -> set { it.copy(likely = it.likely.toggled(v)) } }
+                ChoiceKV("Converted", Tri.entries.map { it.name to it.label }, f.converted.name) { v -> set { it.copy(converted = Tri.valueOf(v)) } }
+                ChoiceKV("Sent", Tri.entries.map { it.name to it.label }, f.sent.name) { v -> set { it.copy(sent = Tri.valueOf(v)) } }
+                if (genreOpts.isNotEmpty()) Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Genre (any of the selected)", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Column {
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            genreOpts.forEach { (g, count) ->
+                                FilterChip(selected = g in f.genres, onClick = { set { it.copy(genres = it.genres.toggled(g)) } }, label = { Text("${titleCase(g)} ($count)") })
+                            }
+                        }
+                    }
+                }
                 ChoiceKV("Needs download", Tri.entries.map { it.name to it.label }, f.download.name) { v -> set { it.copy(download = Tri.valueOf(v)) } }
                 ChoiceKV("Needs review", Tri.entries.map { it.name to it.label }, f.review.name) { v -> set { it.copy(review = Tri.valueOf(v)) } }
+                ChoiceKV("Caught up (chapters read = latest chapter)", Tri.entries.map { it.name to it.label }, f.caughtUp.name) { v -> set { it.copy(caughtUp = Tri.valueOf(v)) } }
             }
         }
     }
@@ -472,13 +654,25 @@ fun LibraryScreen(vm: NovelViewModel, listState: LazyListState, onOpen: (String)
     val novels by vm.shown.collectAsState()
     val all by vm.all.collectAsState()
     val sort by vm.sort.collectAsState()
+    val readingQ by vm.readingQueue.collectAsState()
+    // Multi-select: long-press a card to start, tap to add/remove, then Edit applies one field to all of them.
+    var selected by remember { mutableStateOf(setOf<String>()) }
+    var bulkOpen by remember { mutableStateOf(false) }
+    BackHandler(enabled = selected.isNotEmpty()) { selected = emptySet() }
+    if (bulkOpen) BulkEditDialog(
+        count = selected.size, onDismiss = { bulkOpen = false },
+        onApply = { field, value -> vm.bulkSet(selected, field, value); selected = emptySet(); bulkOpen = false },
+    )
     val queue by vm.queue.collectAsState()
     val plan by vm.importPlan.collectAsState()
     val warnUids by vm.warnUids.collectAsState()
     // The ViewModel owns the query; the text box just shows it. (A local rememberSaveable copy was lost
     // whenever the library left composition, while the ViewModel kept filtering by the old text.)
     val q by vm.query.collectAsState()
+    val searchScope by vm.searchScope.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
+    var showBulk by remember { mutableStateOf(false) }
+    val bulk by vm.bulkAdd.collectAsState()
     var showRefreshAll by remember { mutableStateOf(false) }
     var progressFor by remember { mutableStateOf<String?>(null) }
     var sortOpen by remember { mutableStateOf(false) }
@@ -497,7 +691,14 @@ fun LibraryScreen(vm: NovelViewModel, listState: LazyListState, onOpen: (String)
     Scaffold(
         containerColor = Color.Transparent,
         topBar = {
-            TopAppBar(
+            if (selected.isNotEmpty()) TopAppBar(
+                title = { Text("${selected.size} selected") },
+                navigationIcon = { IconButton(onClick = { selected = emptySet() }) { Icon(Icons.Default.Close, contentDescription = "Cancel selection") } },
+                actions = {
+                    TextButton(onClick = { selected = novels.map { it.uid }.toSet() }) { Text("Select all") }
+                    TextButton(onClick = { bulkOpen = true }) { Text("Edit") }
+                },
+            ) else TopAppBar(
                 title = { Text("Novels (${novels.size}/${all.size})") },
                 actions = {
                     Box {
@@ -513,6 +714,9 @@ fun LibraryScreen(vm: NovelViewModel, listState: LazyListState, onOpen: (String)
                         DropdownMenu(expanded = moreOpen, onDismissRequest = { moreOpen = false }) {
                             DropdownMenuItem(text = { Text("Import CSV…") }, onClick = { moreOpen = false; importLauncher.launch(arrayOf("*/*")) })
                             DropdownMenuItem(text = { Text("Export CSV…") }, onClick = { moreOpen = false; exportLauncher.launch("NovelStatus_export.csv") })
+                            DropdownMenuItem(text = { Text("Add several\u2026") }, onClick = { moreOpen = false; showBulk = true })
+                            DropdownMenuItem(text = { Text("Next to read") }, onClick = { moreOpen = false; vm.nextToRead()?.let { onOpen(it.uid) } })
+                            DropdownMenuItem(text = { Text("Reading queue (${readingQ.size})") }, onClick = { moreOpen = false; go("readq") })
                             DropdownMenuItem(text = { Text("Review counts ($pendingCount)") }, onClick = { moreOpen = false; go("review") })
                             DropdownMenuItem(text = { Text("Data check (${warnUids.size})") }, onClick = { moreOpen = false; go("checks") })
                             DropdownMenuItem(text = { Text("Refresh queue") }, onClick = { moreOpen = false; go("queue") })
@@ -529,7 +733,15 @@ fun LibraryScreen(vm: NovelViewModel, listState: LazyListState, onOpen: (String)
             OutlinedTextField(
                 value = q, onValueChange = { vm.query.value = it }, singleLine = true,
                 leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
-                placeholder = { Text("Search name, genre, author, remarks…") },
+                // Titles only by default, so a word in a description doesn't bring in unrelated novels. Tap to widen.
+                // The small ✕ at the right clears the text.
+                trailingIcon = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        TextButton(onClick = { vm.searchScope.value = if (searchScope == SearchScope.TITLES) SearchScope.ALL else SearchScope.TITLES }) { Text(searchScope.label) }
+                        if (q.isNotEmpty()) IconButton(onClick = { vm.query.value = "" }) { Icon(Icons.Default.Close, contentDescription = "Clear search") }
+                    }
+                },
+                placeholder = { Text(if (searchScope == SearchScope.TITLES) "Search titles…" else "Search titles, genre, author, remarks, description…") },
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
             )
             FilterBar(vm)
@@ -560,24 +772,40 @@ fun LibraryScreen(vm: NovelViewModel, listState: LazyListState, onOpen: (String)
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(novels, key = { it.uid }) { n ->
-                    NovelCard(n, warn = n.uid in warnUids, onOpen = { onOpen(n.uid) }, onProgress = { progressFor = n.uid })
+                    NovelCard(
+                        n, warn = n.uid in warnUids, selected = n.uid in selected, selecting = selected.isNotEmpty(),
+                        onOpen = { if (selected.isNotEmpty()) selected = selected.toggled(n.uid) else onOpen(n.uid) },
+                        onLongPress = { selected = selected.toggled(n.uid) },
+                        onProgress = { progressFor = n.uid },
+                    )
                 }
             }
         }
     }
 
     if (showAdd) AddDialog(onDismiss = { showAdd = false }, onAdd = { n, l -> vm.add(n, l) })
+    if (showBulk || bulk.running || bulk.finished) AddSeveralDialog(
+        bulk, onStart = { vm.startBulkAdd(it) }, onStop = { vm.cancelBulkAdd() },
+        onDone = { showBulk = false; vm.clearBulkAdd() },
+    )
     progressFor?.let { uid ->
         vm.novel(uid)?.let { n -> ProgressDialog(n, onDismiss = { progressFor = null }, onSave = { vm.setRead(uid, it) }) }
     }
-    if (showRefreshAll) RefreshAllDialog(all, onDismiss = { showRefreshAll = false }, onStart = { skip -> vm.startRefreshAll(skip); go("queue") })
+    if (showRefreshAll) RefreshAllDialog(all, onDismiss = { showRefreshAll = false }, onStart = { skip, bg -> if (bg) vm.startRefreshAllInBackground(skip) else vm.startRefreshAll(skip); go("queue") })
     plan?.let { p -> ImportDialog(p, onCancel = { vm.cancelImport() }, onApply = { vm.applyImport(it) }) }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
-fun NovelCard(n: Novel, warn: Boolean, onOpen: () -> Unit, onProgress: () -> Unit) {
-    Card(onClick = onOpen, shape = RoundedCornerShape(12.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+fun NovelCard(
+    n: Novel, warn: Boolean, onOpen: () -> Unit, onProgress: () -> Unit,
+    selected: Boolean = false, selecting: Boolean = false, onLongPress: () -> Unit = {},
+) {
+    Card(
+        modifier = Modifier.combinedClickable(onClick = onOpen, onLongClick = onLongPress),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface),
+    ) {
         Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Cover(n.coverUrl, Modifier.width(56.dp).height(84.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -601,7 +829,7 @@ fun NovelCard(n: Novel, warn: Boolean, onOpen: () -> Unit, onProgress: () -> Uni
             // Ring above Update fills the right-hand side, so the card has no empty corner.
             Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 ProgressRing(n.progress(), centerText = fmt(n.readCount))
-                TextButton(onClick = onProgress) { Text("Update") }
+                TextButton(enabled = !selecting, onClick = onProgress) { Text("Update") }
             }
         }
     }
@@ -610,7 +838,7 @@ fun NovelCard(n: Novel, warn: Boolean, onOpen: () -> Unit, onProgress: () -> Uni
 // ------------------------------------------------------------------ detail
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun DetailScreen(vm: NovelViewModel, uid: String, onBack: () -> Unit, onVerify: () -> Unit) {
+fun DetailScreen(vm: NovelViewModel, uid: String, onBack: () -> Unit, onVerify: () -> Unit, onOpen: (String) -> Unit, useQueue: Boolean = false) {
     val all by vm.all.collectAsState()
     val busy by vm.busy.collectAsState()
     val ctx = LocalContext.current
@@ -622,10 +850,21 @@ fun DetailScreen(vm: NovelViewModel, uid: String, onBack: () -> Unit, onVerify: 
     var progress by remember { mutableStateOf(false) }
     var editNum by remember { mutableStateOf<String?>(null) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf(false) }
     var showHistory by remember { mutableStateOf(false) }
+    var showSimilar by remember { mutableStateOf(false) }
     var remarks by remember(n.uid) { mutableStateOf(n.remarks) }
     var link by remember(n.uid) { mutableStateOf(n.slug) }
     var expanded by remember { mutableStateOf(false) }
+    // Previous / next novel follow the list you came from: the library as currently searched, filtered and sorted
+    // (or the reading queue when opened from it). If this novel drops out of that list after an edit, the arrows
+    // keep working from the place it was.
+    val navList by (if (useQueue) vm.readingQueue else vm.shown).collectAsState()
+    var anchor by remember { mutableStateOf(navList.indexOfFirst { it.uid == uid }) }
+    val here = navList.indexOfFirst { it.uid == uid }
+    LaunchedEffect(here) { if (here >= 0) anchor = here }
+    val prevNovel = if (here >= 0) navList.getOrNull(here - 1) else navList.getOrNull(anchor - 1)
+    val nextNovel = if (here >= 0) navList.getOrNull(here + 1) else navList.getOrNull(anchor)
     val checks = n.issues()
 
     Scaffold(
@@ -635,6 +874,10 @@ fun DetailScreen(vm: NovelViewModel, uid: String, onBack: () -> Unit, onVerify: 
                 title = { Text(n.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } },
                 actions = {
+                    IconButton(onClick = { renaming = true }) { Icon(Icons.Default.Edit, contentDescription = "Rename") }
+                    TextButton(onClick = { if (n.queuePos > 0) vm.removeFromReadingQueue(uid) else vm.addToReadingQueue(uid) }) {
+                        Text(if (n.queuePos > 0) "Unqueue" else "Queue")
+                    }
                     IconButton(enabled = n.slug.isNotBlank() && busy == null, onClick = { vm.refreshOne(uid) }) {
                         Icon(Icons.Default.Refresh, contentDescription = "Refresh from site")
                     }
@@ -644,15 +887,37 @@ fun DetailScreen(vm: NovelViewModel, uid: String, onBack: () -> Unit, onVerify: 
         },
     ) { pad ->
         Column(Modifier.padding(pad).verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            if (prevNovel != null || nextNovel != null) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                IconButton(enabled = prevNovel != null, onClick = { prevNovel?.let { onOpen(it.uid) } }) {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "Previous novel")
+                }
+                Text(
+                    if (here >= 0) "${here + 1} of ${navList.size}" else "", Modifier.weight(1f), textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                IconButton(enabled = nextNovel != null, onClick = { nextNovel?.let { onOpen(it.uid) } }) {
+                    Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "Next novel")
+                }
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
                 Cover(n.coverUrl, Modifier.width(96.dp).height(136.dp))
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(n.name, style = MaterialTheme.typography.titleLarge)
+                    Text(n.name, style = MaterialTheme.typography.titleLarge, modifier = Modifier.clickable { renaming = true })
                     if (n.author.isNotBlank()) Text(n.author, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     val rating = listOf(n.ratingCom to ".com", n.ratingNet to ".net").filter { it.first.isNotBlank() }.joinToString("   ") { "${it.first} ${it.second}" }
                     if (rating.isNotBlank()) Text(rating, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     if (n.busyHint(busy)) Text("Refreshing…", color = Pal.Blue, style = MaterialTheme.typography.bodySmall)
                 }
+            }
+
+            // Description first, right under the title, so it can be read quickly while moving from novel to novel.
+            if (n.genres.isNotBlank()) FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                n.genres.split(';', ',').map { it.trim() }.filter { it.isNotEmpty() }.forEach { Tag(it, MaterialTheme.colorScheme.onSurfaceVariant) }
+            }
+            if (n.altNames.isNotBlank()) Text("Also known as: ${n.altNames}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (n.description.isNotBlank()) {
+                Text(n.description, maxLines = if (expanded) Int.MAX_VALUE else 6, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
+                TextButton(onClick = { expanded = !expanded }) { Text(if (expanded) "Show less" else "Show more") }
             }
 
             if (n.pendingCount > 0) PendingCard(n, vm, onOpen = null)
@@ -738,14 +1003,6 @@ fun DetailScreen(vm: NovelViewModel, uid: String, onBack: () -> Unit, onVerify: 
             }
 
             HorizontalDivider()
-            if (n.genres.isNotBlank()) FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                n.genres.split(";").map { it.trim() }.filter { it.isNotEmpty() }.forEach { Tag(it, MaterialTheme.colorScheme.onSurfaceVariant) }
-            }
-            if (n.altNames.isNotBlank()) Text("Also known as: ${n.altNames}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (n.description.isNotBlank()) {
-                Text(n.description, maxLines = if (expanded) Int.MAX_VALUE else 6, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
-                TextButton(onClick = { expanded = !expanded }) { Text(if (expanded) "Show less" else "Show more") }
-            }
             val counts = n.siteCountMap()
             Text(
                 buildString {
@@ -771,9 +1028,21 @@ fun DetailScreen(vm: NovelViewModel, uid: String, onBack: () -> Unit, onVerify: 
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            // Closest matches by genre: shared genres out of all genres of both, best first.
+            val similar = remember(n.genres, all) { vm.similarByGenre(uid) }
+            if (similar.isNotEmpty()) {
+                TextButton(onClick = { showSimilar = !showSimilar }) { Text(if (showSimilar) "Hide similar novels" else "Similar by genre (${similar.size})") }
+                if (showSimilar) similar.forEach { s ->
+                    Column(Modifier.fillMaxWidth().clickable { onOpen(s.novel.uid) }.defaultMinSize(minHeight = 48.dp).padding(vertical = 6.dp)) {
+                        Text(s.novel.name, style = MaterialTheme.typography.bodyMedium)
+                        Text("${s.percent}% match \u00b7 ${s.shared.joinToString(", ")}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
         }
     }
 
+    if (renaming) RenameDialog(n.name, problem = { vm.renameProblem(uid, it) }, onDismiss = { renaming = false }, onSave = { vm.rename(uid, it) })
     if (progress) ProgressDialog(n, onDismiss = { progress = false }, onSave = { vm.setRead(uid, it) })
     when (editNum) {
         "downloaded" -> NumberDialog(

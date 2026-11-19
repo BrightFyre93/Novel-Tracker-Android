@@ -113,6 +113,8 @@ object NovelParser {
         val titles: List<String>,
         val author: String, val alt: List<String>, val genres: List<String>, val source: String,
         val status: String, val rating: String, val description: String, val cover: String, val latest: Int,
+        /** The link text the newest chapter number was read from (for diagnosing a wrong count). */
+        val latestText: String = "",
     )
 
     private val genericHeadings = setOf(
@@ -154,7 +156,7 @@ object NovelParser {
     }
 
     /** Port of the Python parser; works on both novelfull.com and novelfull.net layouts. */
-    fun parse(html: String, base: String): Page {
+    fun parse(html: String, base: String, slug: String = ""): Page {
         val doc = Jsoup.parse(html, base)
         var author = ""; var alt = ""; var source = ""; var status = ""
         var genres = emptyList<String>()
@@ -218,15 +220,24 @@ object NovelParser {
             ?: doc.selectFirst(".book img, img[itemprop=image]")?.absUrl("src").orEmpty()
 
         // newest chapter = highest "Chapter N" link text (titles not starting with "Chapter N" are not counted)
-        val latest = doc.select("a").mapNotNull {
-            chapterRe.find(it.text())?.groupValues?.get(1)?.replace(",", "")?.toIntOrNull()
-        }.maxOrNull() ?: 0
+        var latest = 0
+        var latestText = ""
+        for (a in doc.select("a")) {
+            val num = chapterRe.find(a.text())?.groupValues?.get(1)?.replace(",", "")?.toIntOrNull() ?: continue
+            if (num > latest) { latest = num; latestText = a.text().trim().take(60) }
+        }
+        // Fallback for pages whose link text doesn't start with "Chapter N" (e.g. "Vol 2 Chapter 5", or just a title):
+        // read the number from this novel's own chapter URLs, /<slug>/chapter-123-....html. Other novels' links are ignored.
+        if (latest == 0 && slug.isNotBlank()) {
+            val hrefRe = Regex("/${Regex.escape(slug)}/[^/]*?chapter[-_](\\d+)", RegexOption.IGNORE_CASE)
+            latest = doc.select("a[href]").mapNotNull { hrefRe.find(it.attr("href"))?.groupValues?.get(1)?.toIntOrNull() }.maxOrNull() ?: 0
+        }
 
         return Page(
             titles = pageTitles(doc),
             author = author, alt = alt.split(",", ";").map { it.trim() }.filter { it.isNotEmpty() },
             genres = genres, source = source, status = normStatus(status), rating = rating,
-            description = desc, cover = cover, latest = latest,
+            description = desc, cover = cover, latest = latest, latestText = latestText,
         )
     }
 }
@@ -260,11 +271,15 @@ class Scraper(ctx: Context) {
             if (i > 0) delay(1200)
             when (val r = web.fetch("${BASES.getValue(s)}/${n.slug}.html")) {
                 is Fetch.Ok -> {
-                    val page = NovelParser.parse(r.html, BASES.getValue(s))
+                    val page = NovelParser.parse(r.html, BASES.getValue(s), n.slug)
                     if (page.titles.isEmpty() && page.latest == 0 && page.description.isEmpty()) {
                         notes.add("$s: couldn't read the page"); fails.add(FailKind.PARSE)
                     } else {
                         pages[s] = page
+                        // Say what the page looked like, so a missing count can be diagnosed from the note alone.
+                        if (page.latest == 0) notes.add("$s: loaded \"${page.titles.firstOrNull().orEmpty().take(40)}\" (${r.html.length} chars) but found no chapter links")
+                        // A decimal chapter ("Chapter 1356.1") counts as its whole number; say so, so the raw text is visible.
+                        else if (Regex("\\d\\.\\d").containsMatchIn(page.latestText.take(20))) notes.add("$s: latest link \"${page.latestText}\" counted as ${page.latest}")
                     }
                 }
                 is Fetch.NotFound -> { notes.add("$s: page not found"); fails.add(FailKind.NOT_FOUND) }

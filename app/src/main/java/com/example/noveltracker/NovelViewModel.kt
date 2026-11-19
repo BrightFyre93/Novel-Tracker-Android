@@ -33,21 +33,30 @@ data class FilterState(
     val reading: Set<String> = emptySet(),
     val novel: Set<String> = emptySet(),
     val likely: Set<String> = emptySet(),
+    /** Lower-case genre names; a novel matches if it has any of them. */
+    val genres: Set<String> = emptySet(),
     val download: Tri = Tri.ALL,
     val review: Tri = Tri.ALL,
+    val converted: Tri = Tri.ALL,
+    val sent: Tri = Tri.ALL,
+    /** Read chapters have reached the latest chapter count (whether the novel is running or completed). */
+    val caughtUp: Tri = Tri.ALL,
     /** Quick toggle: downloaded chapters not yet read. */
     val ready: Boolean = false,
 ) {
     val isDefault: Boolean get() = this == FilterState()
     val activeCount: Int get() = listOf(
-        reading.isNotEmpty(), novel.isNotEmpty(), likely.isNotEmpty(), download != Tri.ALL, review != Tri.ALL, ready,
+        reading.isNotEmpty(), novel.isNotEmpty(), likely.isNotEmpty(), genres.isNotEmpty(), download != Tri.ALL, review != Tri.ALL,
+        converted != Tri.ALL, sent != Tri.ALL, caughtUp != Tri.ALL, ready,
     ).count { it }
 
     fun test(n: Novel): Boolean =
         (reading.isEmpty() || n.readingStatus in reading) &&
             (novel.isEmpty() || n.novelStatus in novel) &&
             (likely.isEmpty() || n.likely in likely) &&
+            (genres.isEmpty() || n.genreSet().any { it in genres }) &&
             download.matches(n.needsDownload) && review.matches(n.needsReview) &&
+            converted.matches(n.conversion) && sent.matches(n.sent) && caughtUp.matches(n.isCaughtUp) &&
             (!ready || n.isReadyToRead)
 }
 
@@ -59,6 +68,28 @@ enum class SortBy(val label: String) {
 
 /** A short-lived "Undo" offered in the snackbar after a read / downloaded edit. */
 data class UndoOffer(val id: Long, val text: String)
+
+/** Fields the library's multi-select "Edit" can set on several novels at once. */
+enum class BulkField(val label: String, val options: List<String>) {
+    LIKELY_TO_READ("Likely to read", LIKELY),
+    READING_STATUS("Reading status", READING),
+    NOVEL_STATUS_FIELD("Novel status", NOVEL_STATUS),
+    CONVERSION("Conversion", listOf("Yes", "No")),
+    SENT("Sent", listOf("Yes", "No")),
+}
+
+/** What the library search looks at. Titles = name and alternative names. */
+enum class SearchScope(val label: String) { TITLES("Titles"), ALL("All text") }
+
+/** A novel whose genres overlap with another's; [percent] = shared genres / all genres of both. */
+data class SimilarNovel(val novel: Novel, val percent: Int, val shared: List<String>)
+
+/** Progress and result of "Add several". [report] starts with a one-line summary, then one line per problem. */
+data class BulkAddState(
+    val running: Boolean = false, val finished: Boolean = false,
+    val done: Int = 0, val total: Int = 0, val current: String = "",
+    val report: List<String> = emptyList(),
+)
 
 enum class ImportMode { MERGE, REPLACE }
 
@@ -95,15 +126,95 @@ private fun SortBy.comparator(): Comparator<Novel> = when (this) {
 
 class NovelViewModel(app: Application) : AndroidViewModel(app) {
     private val ctx = app.applicationContext
-    private val store = NovelStore(ctx, viewModelScope)
+    private val store = NovelStore.get(ctx)
     private val scraper = Scraper(ctx)
 
     val all: StateFlow<List<Novel>> = store.novels
     /** Non-null while the last save failed (changes exist only in memory until a save succeeds). */
     val saveError: StateFlow<String?> = store.saveError
+
+    /** Reading queue: novels you lined up to read next, in the order you chose (Queue Position 1..n; 0 = not queued). */
+    /** Every genre in the library (lower-case) with how many novels have it, most common first. Feeds the genre filter. */
+    val genreOptions: StateFlow<List<Pair<String, Int>>> = all
+        .map { l ->
+            l.flatMap { it.genreSet() }.groupingBy { it }.eachCount().entries
+                .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
+                .map { it.key to it.value }
+        }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /** The closest novels by genre: shared genres divided by all genres of both, best first. Needs the novel to have genres. */
+    fun similarByGenre(uid: String, limit: Int = 5): List<SimilarNovel> {
+        val mine = novel(uid)?.genreSet().orEmpty()
+        if (mine.isEmpty()) return emptyList()
+        return all.value.asSequence().filter { it.uid != uid }.mapNotNull { o ->
+            val theirs = o.genreSet()
+            val shared = mine intersect theirs
+            if (shared.isEmpty()) null
+            else SimilarNovel(o, 100 * shared.size / (mine union theirs).size, shared.sorted().map { titleCase(it) })
+        }.sortedWith(compareByDescending<SimilarNovel> { it.percent }.thenBy { it.novel.key }.thenBy { it.novel.uid })
+            .take(limit).toList()
+    }
+
+    private val queueOrder: Comparator<Novel> = compareBy<Novel> { it.queuePos }.thenBy { it.key }.thenBy { it.uid }
+    /** Current queue straight from the store (not the delayed StateFlow), so back-to-back edits can't race. */
+    private fun queueNow() = all.value.filter { it.queuePos > 0 }.sortedWith(queueOrder)
+
+    val readingQueue: StateFlow<List<Novel>> = all
+        .map { l -> l.filter { it.queuePos > 0 }.sortedWith(queueOrder) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /** First queued novel (in your order) with chapters ready, or null with a short explanation. Never changes anything. */
+    fun nextToRead(): Novel? {
+        val q = queueNow()
+        if (q.isEmpty()) { say("Your reading queue is empty. Open a novel and tap Queue."); return null }
+        val n = q.firstOrNull { it.isNextEligible }
+        if (n == null) say("Nothing in your queue has chapters ready to read.")
+        return n
+    }
+
+    fun addToReadingQueue(uid: String) {
+        val n = novel(uid) ?: return
+        if (n.queuePos > 0) return
+        val next = (all.value.maxOfOrNull { it.queuePos } ?: 0) + 1
+        store.edit(uid) { it.copy(queuePos = next) }
+        say("Added to reading queue (#$next)")
+    }
+
+    /** Removes a novel from the queue and renumbers the rest so positions stay 1..n. Opening or queueing never touches progress or status. */
+    fun removeFromReadingQueue(uid: String) {
+        if (novel(uid)?.queuePos?.let { it > 0 } != true) return
+        val order = queueNow().map { it.uid }.filter { it != uid }
+        store.transform { x ->
+            when {
+                x.uid == uid -> x.copy(queuePos = 0)
+                x.queuePos > 0 -> order.indexOf(x.uid).let { i -> if (i + 1 == x.queuePos) x else x.copy(queuePos = i + 1) }
+                else -> x
+            }
+        }
+    }
+
+    fun moveInReadingQueue(uid: String, delta: Int) {
+        val order = queueNow().map { it.uid }.toMutableList()
+        val i = order.indexOf(uid)
+        val j = i + delta
+        if (i < 0 || j !in order.indices) return
+        val other = order[j]; order[j] = order[i]; order[i] = other
+        store.transform { x ->
+            if (x.queuePos > 0) order.indexOf(x.uid).let { k -> if (k + 1 == x.queuePos) x else x.copy(queuePos = k + 1) } else x
+        }
+    }
     val query = MutableStateFlow("")
     val filters = MutableStateFlow(FilterState())
-    val sort = MutableStateFlow(SortBy.NAME)
+    // The chosen sort is remembered between launches (plain SharedPreferences; the library's filters are not saved).
+    private val prefs = ctx.getSharedPreferences("novel_tracker_prefs", android.content.Context.MODE_PRIVATE)
+    val sort = MutableStateFlow(
+        runCatching { SortBy.valueOf(prefs.getString("sort", null) ?: "NAME") }.getOrDefault(SortBy.NAME),
+    )
+    /** Search looks at titles only by default; the choice is remembered. */
+    val searchScope = MutableStateFlow(
+        runCatching { SearchScope.valueOf(prefs.getString("search_scope", null) ?: "TITLES") }.getOrDefault(SearchScope.TITLES),
+    )
     val messages = MutableSharedFlow<String>(extraBufferCapacity = 16)
 
     // One-step undo for read-count and downloaded-through edits. Only those progress fields are restored, so a
@@ -132,14 +243,15 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
     }
     val importPlan = MutableStateFlow<ImportPlan?>(null)
     val busy = MutableStateFlow<String?>(null)
-    val queue = MutableStateFlow(QueueState())
+    val queue: StateFlow<QueueState> = RefreshEngine.state
     private var queueJob: Job? = null
 
-    val shown: StateFlow<List<Novel>> = combine(all, query, filters, sort) { list, q, f, s ->
+    val shown: StateFlow<List<Novel>> = combine(all, query, filters, sort, searchScope) { list, q, f, s, scope ->
         val tokens = q.trim().lowercase().split(Regex("\\s+")).filter { it.isNotEmpty() }
         list.filter { n ->
             f.test(n) && (tokens.isEmpty() || run {
-                val hay = "${n.name} ${n.altNames} ${n.author} ${n.genres} ${n.remarks} ${n.description}".lowercase()
+                val hay = (if (scope == SearchScope.TITLES) "${n.name} ${n.altNames}"
+                else "${n.name} ${n.altNames} ${n.author} ${n.genres} ${n.remarks} ${n.description}").lowercase()
                 tokens.all { it in hay }
             })
         }.sortedWith(s.comparator().thenBy { it.key }.thenBy { it.uid }) // deterministic: ties fall back to normalised name, then Stable ID
@@ -151,7 +263,10 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
     }.flowOn(Dispatchers.Default).stateIn(viewModelScope, SharingStarted.Eagerly, emptySet())
 
     init {
-        if (!store.load()) seedFromAssets()
+        RefreshEngine.ensureLoaded(ctx)
+        if (!store.ensureLoaded()) seedFromAssets()
+        viewModelScope.launch { sort.collect { prefs.edit().putString("sort", it.name).apply() } }
+        viewModelScope.launch { searchScope.collect { prefs.edit().putString("search_scope", it.name).apply() } }
     }
 
     private fun say(s: String) { messages.tryEmit(s) }
@@ -169,6 +284,24 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------------------------------------------------------------- progress & edits
     fun update(uid: String, f: (Novel) -> Novel) = store.edit(uid, f)
+
+    /**
+     * Sets one field to [value] on every selected novel in a single save. Novels that already have the value are left
+     * untouched (their Edited At does not move). The caller confirms with the user first.
+     */
+    fun bulkSet(uids: Set<String>, field: BulkField, value: String) {
+        val yes = value == "Yes"
+        fun apply(n: Novel): Novel = when (field) {
+            BulkField.LIKELY_TO_READ -> if (n.likely == value) n else n.copy(likely = value)
+            BulkField.READING_STATUS -> if (n.readingStatus == value) n else n.copy(readingStatus = value)
+            BulkField.NOVEL_STATUS_FIELD -> if (n.novelStatus == value) n else n.copy(novelStatus = value)
+            BulkField.CONVERSION -> if (n.conversion == yes) n else n.copy(conversion = yes)
+            BulkField.SENT -> if (n.sent == yes) n else n.copy(sent = yes)
+        }
+        val changed = all.value.count { it.uid in uids && apply(it) !== it }
+        store.transform { n -> if (n.uid in uids) apply(n) else n }
+        say("${field.label} set to $value on $changed novel${if (changed == 1) "" else "s"}")
+    }
 
     fun setRead(uid: String, v: Int) {
         val before = novel(uid) ?: return
@@ -203,15 +336,103 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
         val nm = name.trim()
         if (nm.isEmpty()) return
         if (all.value.any { it.key == nameKey(nm) }) { say("'$nm' already exists"); return }
-        val n = Novel(name = nm, slug = slugFrom(link))
+        val given = slugFrom(link)
+        val guessed = given.isBlank()
+        val slug = if (guessed) slugFromName(nm) else given
+        // A pasted full link also says which mirror it is on, so only that one is tried.
+        val n = Novel(name = nm, slug = slug, sites = siteFromLink(link))
         store.add(n)
-        say("Added $nm")
+        say(if (guessed && slug.isNotBlank()) "Added $nm (link guessed from the name: $slug)" else "Added $nm")
         if (n.slug.isNotBlank()) refreshOne(n.uid)
+    }
+
+    /** Why [name] can't be the new title of [uid] (empty, or another novel already has it), or null if it can. */
+    fun renameProblem(uid: String, name: String): String? {
+        val nm = name.trim()
+        if (nm.isEmpty()) return "Enter a title"
+        val clash = all.value.firstOrNull { it.uid != uid && it.key == nameKey(nm) }
+        return clash?.let { "Already in the library as \"${it.name}\"" }
+    }
+
+    fun rename(uid: String, name: String) {
+        val nm = name.trim()
+        if (renameProblem(uid, nm) != null) return
+        store.edit(uid) { it.copy(name = nm) }
+        say("Renamed to $nm")
     }
 
     fun delete(uid: String) = store.remove(uid)
 
+    // ---------------------------------------------------------------- add several at once
+    val bulkAdd = MutableStateFlow(BulkAddState())
+    private var bulkJob: Job? = null
+
+    /**
+     * Adds a pasted list, one novel name or link per line. A link fills in the name and everything else from the site;
+     * a name is looked up by its guessed page name and keeps the name you typed. Lines already in the library are
+     * skipped; a name that can't be found is added without a link; a bot check stops the run. Only started by a button.
+     */
+    fun startBulkAdd(text: String) {
+        if (bulkJob?.isActive == true || queue.value.running) { say("Wait for the current refresh to finish"); return }
+        val lines = text.lines().map { it.trim().trimStart('-', '*', '\u2022').trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") }.distinct()
+        if (lines.isEmpty()) return
+        bulkAdd.value = BulkAddState(running = true, total = lines.size)
+        bulkJob = viewModelScope.launch {
+            val problems = ArrayList<String>()
+            var added = 0
+            var skipped = 0
+            var processed = 0
+            try {
+                for ((i, line) in lines.withIndex()) {
+                    bulkAdd.update { it.copy(done = i, current = line.take(60)) }
+                    val isLink = line.contains('/') || line.startsWith("http", true) || line.contains(".html", true)
+                    val slug = if (isLink) slugFrom(line) else slugFromName(line)
+                    val placeholder = if (isLink) titleCase(slug.replace('-', ' ')) else line
+                    if (placeholder.isBlank()) { problems.add("Skipped (nothing usable): $line"); skipped++; processed = i + 1; continue }
+                    val dup = all.value.firstOrNull { (isLink && slug.isNotBlank() && it.slug == slug) || it.key == nameKey(placeholder) }
+                    if (dup != null) { skipped++; processed = i + 1; continue }
+                    val tmp = Novel(name = placeholder, slug = slug, sites = if (isLink) siteFromLink(line) else "")
+                    val r = if (slug.isBlank()) null else scraper.fetch(tmp)
+                    when {
+                        r != null && r.blocked -> {
+                            problems.add("Stopped at a bot check before: $line (${lines.size - i} line(s) not added). Use Verify in browser, then paste the rest.")
+                            break
+                        }
+                        r != null && r.ok -> {
+                            val name = if (isLink) r.siteTitle.ifBlank { placeholder } else line
+                            if (all.value.any { it.key == nameKey(name) }) { skipped++; problems.add("Skipped (already in the library as \"$name\"): $line") }
+                            else { store.add(tmp.copy(name = name).applyScrape(r)); added++ }
+                        }
+                        isLink -> {
+                            store.add(tmp.applyScrape(r ?: Scraped(ok = false, blocked = false, note = "No link")))
+                            added++
+                            problems.add("Added with a problem: $line \u2014 ${r?.note.orEmpty()}")
+                        }
+                        else -> {
+                            store.add(Novel(name = line))
+                            added++
+                            problems.add("Added without a link (page not found): $line \u2014 ${r?.note.orEmpty()}")
+                        }
+                    }
+                    processed = i + 1
+                    if (i < lines.lastIndex) delay(1200)
+                }
+            } finally {
+                val summary = "Added $added, skipped $skipped (already in the library)" +
+                    if (processed < lines.size) ", ${lines.size - processed} not processed" else ""
+                bulkAdd.value = BulkAddState(finished = true, done = processed, total = lines.size, report = listOf(summary) + problems)
+            }
+        }
+    }
+
+    fun cancelBulkAdd() { bulkJob?.cancel() }
+    fun clearBulkAdd() { if (!bulkAdd.value.running) bulkAdd.value = BulkAddState() }
+
     fun retrySave() = store.retrySave()
+
+    /** Non-null if novels.csv could not be read at startup (the backup was used instead). Shown once by the app shell. */
+    fun startupNotice(): String? = store.loadNotice
 
     fun clearFilters() { filters.value = FilterState() }
 
@@ -316,13 +537,7 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---------------------------------------------------------------- scraping (always user-initiated)
-    private fun outcome(n: Novel): String {
-        val parts = ArrayList<String>()
-        if (n.pendingCount > 0) parts.add("chapter count needs review")
-        val warn = n.issues().count { it.severity == Severity.WARN }
-        if (warn > 0) parts.add("$warn data warning" + if (warn > 1) "s" else "")
-        return parts.joinToString(", ")
-    }
+    private fun outcome(n: Novel) = refreshOutcome(n)
 
     fun refreshOne(uid: String) {
         viewModelScope.launch {
@@ -339,63 +554,40 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun setItem(uid: String, status: QStatus, note: String = "") {
-        queue.update { q -> q.copy(items = q.items.map { if (it.uid == uid) it.copy(status = status, note = note) else it }) }
-    }
+    private fun requeue(vararg from: QStatus) = RefreshEngine.requeue(ctx, *from)
 
-    private fun requeue(vararg from: QStatus) {
-        queue.update { q -> q.copy(items = q.items.map { if (it.status in from) it.copy(status = QStatus.PENDING, note = "") else it }) }
-    }
-
-    /** Builds the queue and starts it. Only ever called from a button. */
-    fun startRefreshAll(skipToday: Boolean) {
-        if (queue.value.running) return
+    /** Builds the queue from the library. Returns false (with a message) if there is nothing to refresh. */
+    private fun buildRefreshAll(skipToday: Boolean): Boolean {
+        if (queue.value.running) return false
         val dayStart = startOfToday()
         val eligible = all.value.filter { it.slug.isNotBlank() && !(skipToday && it.lastRefreshAt >= dayStart) }
-        if (eligible.isEmpty()) { say("Nothing to refresh"); return }
-        queue.value = QueueState(items = eligible.map { QItem(it.uid, it.name) })
-        runQueue()
+        if (eligible.isEmpty()) { say("Nothing to refresh"); return false }
+        RefreshEngine.replace(ctx, eligible.map { QItem(it.uid, it.name) })
+        return true
+    }
+
+    /** Builds the queue and starts it in the app. Only ever called from a button. */
+    fun startRefreshAll(skipToday: Boolean) { if (buildRefreshAll(skipToday)) runQueue() }
+
+    /**
+     * Builds the queue and hands it to WorkManager so it keeps going when the app is closed (needs a connection and a
+     * battery that is not low). Only ever called from a button.
+     */
+    fun startRefreshAllInBackground(skipToday: Boolean) {
+        if (buildRefreshAll(skipToday)) {
+            BackgroundRefresh.schedule(ctx)
+            say("Refreshing in the background. Progress is in Refresh queue.")
+        }
     }
 
     fun resumeQueue() { requeue(QStatus.BLOCKED, QStatus.RUNNING); runQueue() }
     fun retryFailed() { requeue(QStatus.FAILED); runQueue() }
-    fun retryOne(uid: String) {
-        queue.update { q -> q.copy(items = q.items.map { if (it.uid == uid) it.copy(status = QStatus.PENDING, note = "") else it }) }
-        runQueue()
-    }
-    fun cancelQueue() { queueJob?.cancel() }
-    fun clearQueue() { if (!queue.value.running) queue.value = QueueState() }
+    fun retryOne(uid: String) { RefreshEngine.setItem(ctx, uid, QStatus.PENDING); runQueue() }
+    fun cancelQueue() { queueJob?.cancel(); BackgroundRefresh.cancel(ctx) }
+    fun clearQueue() { RefreshEngine.clear(ctx) }
 
     private fun runQueue() {
         if (queueJob?.isActive == true) return
-        queueJob = viewModelScope.launch {
-            queue.update { it.copy(running = true) }
-            try {
-                while (true) {
-                    val next = queue.value.items.firstOrNull { it.status == QStatus.PENDING } ?: break
-                    val n = novel(next.uid)
-                    if (n == null) { setItem(next.uid, QStatus.FAILED, "Removed from library"); continue }
-                    setItem(next.uid, QStatus.RUNNING)
-                    val r = scraper.fetch(n)
-                    store.editScraped(n.uid) { it.applyScrape(r) }
-                    if (r.blocked) {
-                        setItem(next.uid, QStatus.BLOCKED, r.note)
-                        say("Bot check. Open Verify in browser, solve it, then Resume.")
-                        break
-                    }
-                    if (r.ok) setItem(next.uid, QStatus.DONE, novel(n.uid)?.let { outcome(it) }.orEmpty())
-                    else setItem(next.uid, QStatus.FAILED, r.note)
-                    delay(1000L + Random.nextLong(1500))
-                }
-                val q = queue.value
-                if (q.count(QStatus.PENDING) == 0 && q.count(QStatus.BLOCKED) == 0) {
-                    say("Refresh finished: ${q.count(QStatus.DONE)} updated, ${q.count(QStatus.FAILED)} failed")
-                }
-            } finally {
-                queue.update { q ->
-                    q.copy(running = false, items = q.items.map { if (it.status == QStatus.RUNNING) it.copy(status = QStatus.PENDING) else it })
-                }
-            }
-        }
+        queueJob = viewModelScope.launch { RefreshEngine.run(ctx, store, scraper) { say(it) } }
     }
 }

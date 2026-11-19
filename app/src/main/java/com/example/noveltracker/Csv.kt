@@ -77,6 +77,7 @@ object Csv {
         Col("Cover URL") { it.coverUrl },
         Col("Scrape Notes") { it.scrapeNote },
         Col("Scrape History") { it.scrapeHistory },
+        Col("Queue Position") { it.queuePos.takeIf { p -> p > 0 } ?: "" },
         Col("Dismissed Checks") { it.dismissed },
         Col("Last Read At") { tsOut(it.lastReadAt) },
         Col("Last Refresh At") { tsOut(it.lastRefreshAt) },
@@ -166,7 +167,7 @@ object Csv {
         val cCover = col("cover url"); val cNote = col("scrape notes", "scrape note"); val cDismissed = col("dismissed checks")
         val cReadAt = col("last read at"); val cRefAt = col("last refresh at"); val cAttAt = col("last attempt at")
         val cCreated = col("created at"); val cEdited = col("edited at")
-        val cHist = col("scrape history")
+        val cHist = col("scrape history"); val cQueue = col("queue position")
 
         val notes = ArrayList<String>()
         if (cId < 0) notes.add("No Stable ID column: new IDs are generated and existing rows are matched by name.")
@@ -192,8 +193,17 @@ object Csv {
 
             fun parseCount(raw: String, label: String): Int {
                 if (raw.isEmpty()) return 0
-                val n = raw.replace(",", "").trim().toIntOrNull()
-                if (n == null) { issues.add(problem(rowNo, name, IssueKind.CORRECTED, label, raw, "a whole number", "using 0")); return 0 }
+                // "101.1" is chapter 101: drop the part after the point (never join the digits into 1011) and report it.
+                val cleaned = raw.replace(",", "").trim()
+                val n = cleaned.toIntOrNull()
+                if (n == null) {
+                    val d = cleaned.toDoubleOrNull()
+                    if (d != null && d.isFinite() && d >= 0 && d < Int.MAX_VALUE) {
+                        issues.add(problem(rowNo, name, IssueKind.CORRECTED, label, raw, "a whole number", "using ${d.toInt()}, the part after the point is dropped"))
+                        return d.toInt()
+                    }
+                    issues.add(problem(rowNo, name, IssueKind.CORRECTED, label, raw, "a whole number", "using 0")); return 0
+                }
                 if (n < 0) { issues.add(problem(rowNo, name, IssueKind.CORRECTED, label, raw, "0 or more", "using 0")); return 0 }
                 return n
             }
@@ -271,7 +281,7 @@ object Csv {
                 siteTitle = s(cSiteTitle), siteStatus = s(cSiteStatus),
                 siteCounts = if (manual) "" else encodeCounts(counts),
                 ratingCom = s(cRatCom), ratingNet = s(cRatNet), description = s(cDesc), coverUrl = s(cCover),
-                scrapeNote = s(cNote), scrapeHistory = history, dismissed = s(cDismissed),
+                scrapeNote = s(cNote), scrapeHistory = history, queuePos = count(cQueue, "Queue Position"), dismissed = s(cDismissed),
                 lastReadAt = tsIn(s(cReadAt)), lastRefreshAt = tsIn(s(cRefAt)), lastAttemptAt = tsIn(s(cAttAt)),
                 createdAt = tsIn(s(cCreated)).takeIf { it > 0 } ?: now,
                 editedAt = tsIn(s(cEdited)).takeIf { it > 0 } ?: now,

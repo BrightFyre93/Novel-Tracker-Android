@@ -17,8 +17,8 @@ android {
         applicationId = "com.example.noveltracker"
         minSdk = 37
         targetSdk = 37
-        versionCode = 6
-        versionName = "6.0"
+        versionCode = 13
+        versionName = "13.0"
     }
 
     buildTypes {
@@ -40,6 +40,7 @@ android {
 
 dependencies {
     implementation("org.jsoup:jsoup:1.18.3")
+    implementation("androidx.work:work-runtime-ktx:2.10.0")
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.material3)
