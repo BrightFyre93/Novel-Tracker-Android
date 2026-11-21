@@ -152,7 +152,7 @@ fun ReviewScreen(vm: NovelViewModel, onBack: () -> Unit, onOpen: (String) -> Uni
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
                         if (pending.isEmpty()) "Nothing to review."
-                        else "Nothing here has been changed yet. Accept the site's count, pick a source when they disagree, or keep yours.",
+                        else "Nothing here has been changed yet. Accept the site's count, pick a source when they disagree, or keep yours. Keeping is remembered until the site's numbers change; picking a source is remembered as that novel's preferred source.",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     if (increases > 0) Button(onClick = { vm.acceptAllIncreases() }) { Text("Accept all $increases increases") }

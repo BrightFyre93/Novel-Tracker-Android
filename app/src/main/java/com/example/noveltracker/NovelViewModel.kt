@@ -84,12 +84,8 @@ enum class SearchScope(val label: String) { TITLES("Titles"), ALL("All text") }
 /** A novel whose genres overlap with another's; [percent] = shared genres / all genres of both. */
 data class SimilarNovel(val novel: Novel, val percent: Int, val shared: List<String>)
 
-/** Progress and result of "Add several". [report] starts with a one-line summary, then one line per problem. */
-data class BulkAddState(
-    val running: Boolean = false, val finished: Boolean = false,
-    val done: Int = 0, val total: Int = 0, val current: String = "",
-    val report: List<String> = emptyList(),
-)
+/** Result of "Add several": [report] starts with a one-line summary, then one line per problem. */
+data class BulkAddState(val finished: Boolean = false, val report: List<String> = emptyList())
 
 enum class ImportMode { MERGE, REPLACE }
 
@@ -101,7 +97,11 @@ data class ImportPlan(
 )
 
 enum class QStatus { PENDING, RUNNING, DONE, FAILED, BLOCKED }
-data class QItem(val uid: String, val name: String, val status: QStatus = QStatus.PENDING, val note: String = "")
+data class QItem(
+    val uid: String, val name: String, val status: QStatus = QStatus.PENDING, val note: String = "",
+    /** Set for novels added from a link: after the first successful fetch the title made from the page name is replaced by the site's title. */
+    val renameOnSuccess: Boolean = false,
+)
 data class QueueState(val items: List<QItem> = emptyList(), val running: Boolean = false) {
     fun count(s: QStatus) = items.count { it.status == s }
 }
@@ -365,69 +365,61 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------------------------------------------------------------- add several at once
     val bulkAdd = MutableStateFlow(BulkAddState())
-    private var bulkJob: Job? = null
 
     /**
-     * Adds a pasted list, one novel name or link per line. A link fills in the name and everything else from the site;
-     * a name is looked up by its guessed page name and keeps the name you typed. Lines already in the library are
-     * skipped; a name that can't be found is added without a link; a bot check stops the run. Only started by a button.
+     * Adds a pasted list, one novel name or link per line, instantly. A link gets a title made from its page name (the
+     * site's title replaces it after the first fetch); a name keeps the name you typed with a guessed page name. Lines
+     * already in the library are skipped. The details (genres, author, chapters, cover...) are fetched one novel at a time
+     * by the refresh queue in the background, so the app stays usable. Only started by a button.
      */
     fun startBulkAdd(text: String) {
-        if (bulkJob?.isActive == true || queue.value.running) { say("Wait for the current refresh to finish"); return }
         val lines = text.lines().map { it.trim().trimStart('-', '*', '\u2022').trim() }
             .filter { it.isNotEmpty() && !it.startsWith("#") }.distinct()
         if (lines.isEmpty()) return
-        bulkAdd.value = BulkAddState(running = true, total = lines.size)
-        bulkJob = viewModelScope.launch {
-            val problems = ArrayList<String>()
-            var added = 0
-            var skipped = 0
-            var processed = 0
-            try {
-                for ((i, line) in lines.withIndex()) {
-                    bulkAdd.update { it.copy(done = i, current = line.take(60)) }
-                    val isLink = line.contains('/') || line.startsWith("http", true) || line.contains(".html", true)
-                    val slug = if (isLink) slugFrom(line) else slugFromName(line)
-                    val placeholder = if (isLink) titleCase(slug.replace('-', ' ')) else line
-                    if (placeholder.isBlank()) { problems.add("Skipped (nothing usable): $line"); skipped++; processed = i + 1; continue }
-                    val dup = all.value.firstOrNull { (isLink && slug.isNotBlank() && it.slug == slug) || it.key == nameKey(placeholder) }
-                    if (dup != null) { skipped++; processed = i + 1; continue }
-                    val tmp = Novel(name = placeholder, slug = slug, sites = if (isLink) siteFromLink(line) else "")
-                    val r = if (slug.isBlank()) null else scraper.fetch(tmp)
-                    when {
-                        r != null && r.blocked -> {
-                            problems.add("Stopped at a bot check before: $line (${lines.size - i} line(s) not added). Use Verify in browser, then paste the rest.")
-                            break
-                        }
-                        r != null && r.ok -> {
-                            val name = if (isLink) r.siteTitle.ifBlank { placeholder } else line
-                            if (all.value.any { it.key == nameKey(name) }) { skipped++; problems.add("Skipped (already in the library as \"$name\"): $line") }
-                            else { store.add(tmp.copy(name = name).applyScrape(r)); added++ }
-                        }
-                        isLink -> {
-                            store.add(tmp.applyScrape(r ?: Scraped(ok = false, blocked = false, note = "No link")))
-                            added++
-                            problems.add("Added with a problem: $line \u2014 ${r?.note.orEmpty()}")
-                        }
-                        else -> {
-                            store.add(Novel(name = line))
-                            added++
-                            problems.add("Added without a link (page not found): $line \u2014 ${r?.note.orEmpty()}")
-                        }
-                    }
-                    processed = i + 1
-                    if (i < lines.lastIndex) delay(1200)
-                }
-            } finally {
-                val summary = "Added $added, skipped $skipped (already in the library)" +
-                    if (processed < lines.size) ", ${lines.size - processed} not processed" else ""
-                bulkAdd.value = BulkAddState(finished = true, done = processed, total = lines.size, report = listOf(summary) + problems)
-            }
+        val problems = ArrayList<String>()
+        val items = ArrayList<QItem>()
+        var added = 0
+        var skipped = 0
+        for (line in lines) {
+            val isLink = line.contains('/') || line.startsWith("http", true) || line.contains(".html", true)
+            val slug = if (isLink) slugFrom(line) else slugFromName(line)
+            val name = if (isLink) placeholderName(slug) else line
+            if (name.isBlank()) { problems.add("Skipped (nothing usable): $line"); skipped++; continue }
+            if (all.value.any { (isLink && slug.isNotBlank() && it.slug == slug) || it.key == nameKey(name) }) { skipped++; continue }
+            val n = Novel(name = name, slug = slug, sites = if (isLink) siteFromLink(line) else "")
+            store.add(n)
+            added++
+            if (slug.isNotBlank()) items.add(QItem(n.uid, n.name, renameOnSuccess = isLink))
+            else problems.add("Added without a link (no page name could be made): $line")
         }
+        if (items.isNotEmpty()) {
+            RefreshEngine.append(ctx, items)
+            // If a run is already going it picks the new items up by itself; otherwise start one in the background.
+            if (!queue.value.running) BackgroundRefresh.schedule(ctx)
+        }
+        val summary = "Added $added, skipped $skipped (already in the library)"
+        val tail = if (items.isNotEmpty()) listOf(
+            "${items.size} novel${if (items.size == 1) " is" else "s are"} being filled in from the sites in the background (title for links, genres, author, chapters, cover). Progress is in the refresh strip; one that fails shows there as failed.",
+        ) else emptyList()
+        bulkAdd.value = BulkAddState(finished = true, report = listOf(summary) + tail + problems)
     }
 
-    fun cancelBulkAdd() { bulkJob?.cancel() }
-    fun clearBulkAdd() { if (!bulkAdd.value.running) bulkAdd.value = BulkAddState() }
+    fun clearBulkAdd() { bulkAdd.value = BulkAddState() }
+
+    // ---------------------------------------------------------------- download counts from the Windows app
+    /** Reads text copied from the Windows app and works out what would change. Changes nothing. */
+    fun planDownloadSync(text: String): DownloadSyncPlan = DownloadSync.plan(text, all.value)
+
+    /** Sets the downloaded-through chapter of every listed novel in one save. */
+    fun applyDownloadSync(updates: List<DownloadUpdate>) {
+        if (updates.isEmpty()) return
+        val byUid = updates.associateBy { it.uid }
+        store.transform { n ->
+            val u = byUid[n.uid]
+            if (u == null || n.downloadedThrough == u.to) n else n.copy(downloadedThrough = u.to, downloadedSource = "windows")
+        }
+        say("Updated downloads for ${updates.size} novel${if (updates.size == 1) "" else "s"}")
+    }
 
     fun retrySave() = store.retrySave()
 
@@ -441,17 +433,25 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
         val n = novel(uid) ?: return
         val v = if (source != null) n.siteCountMap()[source] ?: return else n.pendingCount
         if (v <= 0) return
-        store.edit(uid) { it.copy(currentCount = v, pendingCount = 0, pendingReason = "").afterProgress() }
+        // Choosing a site (Use .com / Use .net) is remembered as the preferred source, so later refreshes use it
+        // automatically instead of asking again whenever the sites disagree.
+        store.edit(uid) {
+            it.copy(currentCount = v, pendingCount = 0, pendingReason = "", preferredSource = source ?: it.preferredSource)
+                .afterProgress().withoutKept()
+        }
     }
 
-    fun keepCount(uid: String) = store.edit(uid) { it.copy(pendingCount = 0, pendingReason = "") }
+    /** Keep my count. Remembers the site numbers it was decided for, so the same numbers aren't proposed again. */
+    fun keepCount(uid: String) = store.edit(uid) {
+        it.copy(pendingCount = 0, pendingReason = "").withKept(countsSignature(it.siteCountMap()))
+    }
 
     private fun isIncrease(n: Novel) = n.pendingCount > n.currentCount && !n.pendingReason.startsWith("Sources disagree")
 
     fun acceptAllIncreases() {
         val k = all.value.count { isIncrease(it) }
         if (k == 0) return
-        store.transform { if (isIncrease(it)) it.copy(currentCount = it.pendingCount, pendingCount = 0, pendingReason = "").afterProgress() else it }
+        store.transform { if (isIncrease(it)) it.copy(currentCount = it.pendingCount, pendingCount = 0, pendingReason = "").afterProgress().withoutKept() else it }
         say("Accepted $k increases")
     }
 

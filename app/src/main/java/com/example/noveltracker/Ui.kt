@@ -486,44 +486,85 @@ private suspend fun SnackbarHostState.showTimed(text: String, millis: Long, acti
 }
 
 /**
- * Add several novels at once: paste one name or link per line. While it runs the dialog shows progress and a Stop
- * button; at the end it lists what was added, skipped and what needs attention.
+ * Add several novels at once: paste one name or link per line. They are added straight away and the details are filled in
+ * by the refresh queue in the background, so the app stays usable; the dialog then lists what was added and skipped.
  */
 @Composable
-fun AddSeveralDialog(state: BulkAddState, onStart: (String) -> Unit, onStop: () -> Unit, onDone: () -> Unit) {
+fun AddSeveralDialog(state: BulkAddState, onStart: (String) -> Unit, onDone: () -> Unit) {
     var text by rememberSaveable { mutableStateOf("") }
-    val idle = !state.running && !state.finished
     AlertDialog(
-        onDismissRequest = { if (idle) onDone() },
-        title = { Text(if (state.running) "Adding\u2026" else if (state.finished) "Done" else "Add several novels") },
+        onDismissRequest = { if (!state.finished) onDone() },
+        title = { Text(if (state.finished) "Done" else "Add several novels") },
         text = {
-            when {
-                state.running -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("${minOf(state.done + 1, state.total)} of ${state.total}: ${state.current}")
-                    LinearProgressIndicator(progress = { state.done / state.total.coerceAtLeast(1).toFloat() }, modifier = Modifier.fillMaxWidth())
-                    Text("Needs a connection. A bot check stops it.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (state.finished) Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                state.report.forEachIndexed { i, line ->
+                    Text(line, style = if (i == 0) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
+                        color = if (i == 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                state.finished -> Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    state.report.forEachIndexed { i, line ->
-                        Text(line, style = if (i == 0) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall,
-                            color = if (i == 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
+            } else OutlinedTextField(
+                value = text, onValueChange = { text = it }, label = { Text("One name or link per line") },
+                minLines = 6, maxLines = 10, modifier = Modifier.fillMaxWidth(),
+                supportingText = { Text("A link fills in the title and details from the site, a name is looked up on both sites. Details are fetched in the background. Lines already in your library are skipped.") },
+            )
+        },
+        confirmButton = {
+            if (state.finished) TextButton(onClick = onDone) { Text("Done") }
+            else TextButton(enabled = text.isNotBlank(), onClick = { onStart(text) }) { Text("Add") }
+        },
+        dismissButton = { if (!state.finished) TextButton(onClick = onDone) { Text("Cancel") } },
+    )
+}
+
+/**
+ * Update the downloaded-through chapter of many novels from text copied out of the Windows app. First a preview of
+ * exactly what would change (and what couldn't be matched), then Apply.
+ */
+@Composable
+fun DownloadSyncDialog(vm: NovelViewModel, onDismiss: () -> Unit) {
+    var text by rememberSaveable { mutableStateOf("") }
+    var plan by remember { mutableStateOf<DownloadSyncPlan?>(null) }
+    var allowLower by remember { mutableStateOf(false) }
+    val p = plan
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (p == null) "Update downloads from text" else "Check before applying") },
+        text = {
+            if (p == null) OutlinedTextField(
+                value = text, onValueChange = { text = it }, label = { Text("Paste the text from the Windows app") },
+                minLines = 6, maxLines = 10, modifier = Modifier.fillMaxWidth(),
+                supportingText = { Text("First line is a header such as Name,Downloaded (optionally Slug and Stable ID). Matched by Stable ID, then page name, then name.") },
+            ) else Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("${p.raises} go up, ${p.drops} go down, ${p.unchanged} already match", style = MaterialTheme.typography.bodyMedium)
+                if (p.drops > 0) Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = allowLower, onCheckedChange = { allowLower = it })
+                    Text("Also apply the ${p.drops} lower number${if (p.drops == 1) "" else "s"}", Modifier.clickable { allowLower = !allowLower })
                 }
-                else -> OutlinedTextField(
-                    value = text, onValueChange = { text = it }, label = { Text("One name or link per line") },
-                    minLines = 6, maxLines = 10, modifier = Modifier.fillMaxWidth(),
-                    supportingText = { Text("A link fills in the name and details from the site. A name is looked up on both sites. Lines already in your library are skipped.") },
+                p.updates.take(12).forEach { u ->
+                    val lower = u.to < u.from
+                    Text(
+                        "${u.name}: ${fmt(u.from)} \u2192 ${fmt(u.to)}" + if (lower) " (lower)" else "",
+                        style = MaterialTheme.typography.bodySmall, color = if (lower) Pal.Yellow else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (p.updates.size > 12) Text("\u2026and ${p.updates.size - 12} more", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (p.notFound.isNotEmpty()) Text(
+                    "Not in your library (${p.notFound.size}): ${p.notFound.take(6).joinToString(", ")}${if (p.notFound.size > 6) "\u2026" else ""}",
+                    style = MaterialTheme.typography.bodySmall, color = Pal.Yellow,
+                )
+                if (p.badLines.isNotEmpty()) Text(
+                    "Couldn't read ${p.badLines.size} line${if (p.badLines.size == 1) "" else "s"}: ${p.badLines.first()}",
+                    style = MaterialTheme.typography.bodySmall, color = Pal.Red,
                 )
             }
         },
         confirmButton = {
-            when {
-                state.running -> TextButton(onClick = onStop) { Text("Stop") }
-                state.finished -> TextButton(onClick = onDone) { Text("Done") }
-                else -> TextButton(enabled = text.isNotBlank(), onClick = { onStart(text) }) { Text("Add") }
+            if (p == null) TextButton(enabled = text.isNotBlank(), onClick = { plan = vm.planDownloadSync(text) }) { Text("Preview") }
+            else {
+                val apply = p.updates.filter { allowLower || it.to > it.from }
+                TextButton(enabled = apply.isNotEmpty(), onClick = { vm.applyDownloadSync(apply); onDismiss() }) { Text("Apply (${apply.size})") }
             }
         },
-        dismissButton = { if (idle) TextButton(onClick = onDone) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = { if (p == null) onDismiss() else plan = null }) { Text(if (p == null) "Cancel" else "Back") } },
     )
 }
 
@@ -672,6 +713,7 @@ fun LibraryScreen(vm: NovelViewModel, listState: LazyListState, onOpen: (String)
     val searchScope by vm.searchScope.collectAsState()
     var showAdd by remember { mutableStateOf(false) }
     var showBulk by remember { mutableStateOf(false) }
+    var showSync by remember { mutableStateOf(false) }
     val bulk by vm.bulkAdd.collectAsState()
     var showRefreshAll by remember { mutableStateOf(false) }
     var progressFor by remember { mutableStateOf<String?>(null) }
@@ -715,6 +757,7 @@ fun LibraryScreen(vm: NovelViewModel, listState: LazyListState, onOpen: (String)
                             DropdownMenuItem(text = { Text("Import CSV…") }, onClick = { moreOpen = false; importLauncher.launch(arrayOf("*/*")) })
                             DropdownMenuItem(text = { Text("Export CSV…") }, onClick = { moreOpen = false; exportLauncher.launch("NovelStatus_export.csv") })
                             DropdownMenuItem(text = { Text("Add several\u2026") }, onClick = { moreOpen = false; showBulk = true })
+                            DropdownMenuItem(text = { Text("Update downloads from text\u2026") }, onClick = { moreOpen = false; showSync = true })
                             DropdownMenuItem(text = { Text("Next to read") }, onClick = { moreOpen = false; vm.nextToRead()?.let { onOpen(it.uid) } })
                             DropdownMenuItem(text = { Text("Reading queue (${readingQ.size})") }, onClick = { moreOpen = false; go("readq") })
                             DropdownMenuItem(text = { Text("Review counts ($pendingCount)") }, onClick = { moreOpen = false; go("review") })
@@ -784,10 +827,11 @@ fun LibraryScreen(vm: NovelViewModel, listState: LazyListState, onOpen: (String)
     }
 
     if (showAdd) AddDialog(onDismiss = { showAdd = false }, onAdd = { n, l -> vm.add(n, l) })
-    if (showBulk || bulk.running || bulk.finished) AddSeveralDialog(
-        bulk, onStart = { vm.startBulkAdd(it) }, onStop = { vm.cancelBulkAdd() },
+    if (showBulk || bulk.finished) AddSeveralDialog(
+        bulk, onStart = { vm.startBulkAdd(it) },
         onDone = { showBulk = false; vm.clearBulkAdd() },
     )
+    if (showSync) DownloadSyncDialog(vm, onDismiss = { showSync = false })
     progressFor?.let { uid ->
         vm.novel(uid)?.let { n -> ProgressDialog(n, onDismiss = { progressFor = null }, onSave = { vm.setRead(uid, it) }) }
     }

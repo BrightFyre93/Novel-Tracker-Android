@@ -321,7 +321,12 @@ class Scraper(ctx: Context) {
  */
 fun Novel.applyScrape(s: Scraped, now: Long = System.currentTimeMillis()): Novel {
     if (!s.ok) return copy(scrapeNote = s.note, lastAttemptAt = now)
-    val d = decideCount(this, s.counts, autoApply = true)
+    val decided = decideCount(this, s.counts, autoApply = true)
+    // You chose "Keep my count" for exactly these site numbers: don't ask again until the site's numbers change.
+    val sig = countsSignature(s.counts)
+    val d = if (decided.pending > 0 && decided.newCurrent == currentCount && sig.isNotEmpty() && sig == keptSignature())
+        decided.copy(pending = 0, reason = "", note = "Site shows ${fmt(decided.pending)}; you chose to keep ${fmt(currentCount)}")
+    else decided
     val notes = listOf(s.note, d.note).filter { it.isNotEmpty() }
     val outcome = when {
         manualChapters -> "MANUAL"

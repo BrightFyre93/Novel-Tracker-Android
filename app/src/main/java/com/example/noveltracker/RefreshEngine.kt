@@ -50,7 +50,10 @@ object RefreshEngine {
             val items = (0 until arr.length()).map { i ->
                 val o = arr.getJSONObject(i)
                 val st = runCatching { QStatus.valueOf(o.getString("s")) }.getOrDefault(QStatus.PENDING)
-                QItem(o.getString("u"), o.optString("n"), if (st == QStatus.RUNNING) QStatus.PENDING else st, o.optString("t"))
+                QItem(
+                    o.getString("u"), o.optString("n"), if (st == QStatus.RUNNING) QStatus.PENDING else st, o.optString("t"),
+                    renameOnSuccess = o.optBoolean("r", false),
+                )
             }
             state.value = QueueState(items = items, running = false)
         }
@@ -59,7 +62,9 @@ object RefreshEngine {
     private fun save(ctx: Context) {
         runCatching {
             val arr = JSONArray()
-            state.value.items.forEach { arr.put(JSONObject().put("u", it.uid).put("n", it.name).put("s", it.status.name).put("t", it.note)) }
+            state.value.items.forEach {
+                arr.put(JSONObject().put("u", it.uid).put("n", it.name).put("s", it.status.name).put("t", it.note).put("r", it.renameOnSuccess))
+            }
             val f = file(ctx)
             val tmp = File(f.path + ".tmp")
             tmp.writeText(arr.toString())
@@ -70,6 +75,11 @@ object RefreshEngine {
     private fun mutate(ctx: Context, f: (QueueState) -> QueueState) { state.update(f); save(ctx) }
 
     fun replace(ctx: Context, items: List<QItem>) = mutate(ctx) { QueueState(items = items) }
+
+    /** Adds items to the end of the queue (an older entry for the same novel is replaced). A runner that is going picks them up. */
+    fun append(ctx: Context, items: List<QItem>) = mutate(ctx) { q ->
+        q.copy(items = q.items.filter { old -> items.none { it.uid == old.uid } } + items)
+    }
 
     fun clear(ctx: Context) { if (!state.value.running) mutate(ctx) { QueueState() } }
 
@@ -95,7 +105,15 @@ object RefreshEngine {
                     if (n == null) { setItem(ctx, next.uid, QStatus.FAILED, "Removed from library"); continue }
                     setItem(ctx, next.uid, QStatus.RUNNING)
                     val r = scraper.fetch(n)
-                    store.editScraped(n.uid) { it.applyScrape(r) }
+                    store.editScraped(n.uid) { x ->
+                        val applied = x.applyScrape(r)
+                        // A novel added from a link starts with a title made from its page name; take the site's real title
+                        // once, and only if you haven't renamed it since and no other novel already has that title.
+                        val title = r.siteTitle
+                        if (next.renameOnSuccess && r.ok && title.isNotBlank() && title != x.name && x.name == placeholderName(x.slug) &&
+                            store.novels.value.none { it.uid != x.uid && it.key == nameKey(title) }
+                        ) applied.copy(name = title) else applied
+                    }
                     if (r.blocked) {
                         setItem(ctx, next.uid, QStatus.BLOCKED, r.note)
                         say("Bot check. Open Verify in browser, solve it, then Resume.")

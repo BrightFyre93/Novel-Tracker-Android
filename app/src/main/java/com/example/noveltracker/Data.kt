@@ -181,6 +181,24 @@ fun Novel.genreSet(): Set<String> =
 /** "sci-fi action" -> "Sci-fi Action" */
 fun titleCase(s: String): String = s.split(' ').joinToString(" ") { w -> w.replaceFirstChar { it.uppercaseChar() } }
 
+/** The title made from a page name when only a link is known: "gamer-reborn" -> "Gamer Reborn". */
+fun placeholderName(slug: String): String = titleCase(slug.replace('-', ' ')).trim()
+
+// ---- Remembered "Keep my chapter count" decisions. Stored as a `KEPT:com=1500,net=1500` entry in the dismissed list,
+// so no extra CSV column is needed. A refresh only proposes the same site count again if the site's numbers changed.
+private const val KEPT_PREFIX = "KEPT:"
+
+/** "com=1500,net=1499" for the given per-site counts (zero counts ignored), the same text every time for the same counts. */
+fun countsSignature(counts: Map<String, Int>): String =
+    counts.filterValues { it > 0 }.toSortedMap().entries.joinToString(",") { "${it.key}=${it.value}" }
+
+fun Novel.keptSignature(): String = dismissedSet().firstOrNull { it.startsWith(KEPT_PREFIX) }?.removePrefix(KEPT_PREFIX).orEmpty()
+
+fun Novel.withKept(signature: String): Novel =
+    copy(dismissed = (dismissedSet().filterNot { it.startsWith(KEPT_PREFIX) } + (KEPT_PREFIX + signature)).joinToString(";"))
+
+fun Novel.withoutKept(): Novel = copy(dismissed = dismissedSet().filterNot { it.startsWith(KEPT_PREFIX) }.joinToString(";"))
+
 fun Novel.ruleDownloadDefault(): Int = if (conversion && sent) currentCount else 0
 fun Novel.dismissedSet(): Set<String> = dismissed.split(";").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
 
