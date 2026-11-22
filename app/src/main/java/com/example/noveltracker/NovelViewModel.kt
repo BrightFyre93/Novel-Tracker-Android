@@ -413,11 +413,28 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
     /** Sets the downloaded-through chapter of every listed novel in one save. */
     fun applyDownloadSync(updates: List<DownloadUpdate>) {
         if (updates.isEmpty()) return
+
         val byUid = updates.associateBy { it.uid }
-        store.transform { n ->
-            val u = byUid[n.uid]
-            if (u == null || n.downloadedThrough == u.to) n else n.copy(downloadedThrough = u.to, downloadedSource = "windows")
+
+        store.transform { novel ->
+            val update = byUid[novel.uid] ?: return@transform novel
+
+            val downloadChanged = novel.downloadedThrough != update.to
+            val conversionChanged = !novel.conversion
+            val sentChanged = !novel.sent
+
+            if (!downloadChanged) {
+                return@transform novel
+            }
+
+            novel.copy(
+                downloadedThrough = update.to,
+                downloadedSource = "windows",
+                conversion = true,
+                sent = true
+            )
         }
+
         say("Updated downloads for ${updates.size} novel${if (updates.size == 1) "" else "s"}")
     }
 

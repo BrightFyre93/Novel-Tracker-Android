@@ -17,8 +17,8 @@ android {
         applicationId = "com.example.noveltracker"
         minSdk = 37
         targetSdk = 37
-        versionCode = 14
-        versionName = "14.0"
+        versionCode = 15
+        versionName = "15.0"
     }
 
     buildTypes {
