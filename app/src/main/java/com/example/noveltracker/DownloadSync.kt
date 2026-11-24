@@ -6,6 +6,7 @@ data class DownloadUpdate(val uid: String, val name: String, val from: Int, val 
 /** What pasting Windows-app text would do. Nothing has been changed when you have this. */
 data class DownloadSyncPlan(
     /** Matched novels whose downloaded number would change (raised or lowered). */
+    /** Matched novels whose downloaded number would change (raised or lowered). */
     val updates: List<DownloadUpdate>,
     /** Matched novels that already have that number. */
     val unchanged: Int,

@@ -74,6 +74,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -112,6 +113,8 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
+
 
 // ------------------------------------------------------------------ theme
 /** Colours follow your Excel rules: green = done/yes, blue = running, yellow = not started/maybe, red = no/aborted. */
@@ -346,12 +349,12 @@ fun AddDialog(onDismiss: () -> Unit, onAdd: (String, String) -> Unit) {
 }
 
 @Composable
-fun RefreshAllDialog(all: List<Novel>, onDismiss: () -> Unit, onStart: (skip: Boolean, background: Boolean) -> Unit) {
+fun RefreshAllDialog(all: List<Novel>,parallel: Int,onParallelChange: (Int) -> Unit, onDismiss: () -> Unit, onStart: (skip: Boolean, background: Boolean) -> Unit) {
     var skip by remember { mutableStateOf(true) }
     var background by remember { mutableStateOf(false) }
     val linked = all.filter { it.slug.isNotBlank() }
     val pages = linked.sumOf { n -> n.sites.split(",").count { it.trim() in BASES }.let { if (it == 0) BASES.size else it } }
-    val minutes = (pages * 4 / 60).coerceAtLeast(1)
+    val minutes = (pages * 4 / 60 / parallel).coerceAtLeast(1)
     AlertDialog(
         onDismissRequest = onDismiss, title = { Text("Refresh all links?") },
         text = {
@@ -368,6 +371,14 @@ fun RefreshAllDialog(all: List<Novel>, onDismiss: () -> Unit, onStart: (skip: Bo
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Checkbox(checked = background, onCheckedChange = { background = it })
                     Text("Keep going in the background (needs a connection; a bot check pauses it)", Modifier.clickable { background = !background }.padding(vertical = 12.dp))
+                }
+                Column {
+                    Text("Novels at a time: $parallel", style = MaterialTheme.typography.bodyMedium)
+                    Slider(
+                        value = parallel.toFloat(), onValueChange = { onParallelChange(it.roundToInt()) },
+                        valueRange = RefreshSettings.MIN.toFloat()..RefreshSettings.MAX.toFloat(), steps = RefreshSettings.MAX - RefreshSettings.MIN - 1,
+                    )
+                    Text("More at once is faster, but heavier on the phone and more likely to trigger a bot check. Also used by background refresh and Add several.", style = MaterialTheme.typography.bodySmall)
                 }
             }
         },
@@ -720,6 +731,7 @@ fun LibraryScreen(vm: NovelViewModel, listState: LazyListState, onOpen: (String)
     var sortOpen by remember { mutableStateOf(false) }
     var moreOpen by remember { mutableStateOf(false) }
     val pendingCount = all.count { it.pendingCount > 0 }
+    val refreshParallel by vm.refreshParallel.collectAsState()
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) vm.readForImport(uri) }
     val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri -> if (uri != null) vm.export(uri) }
@@ -835,7 +847,7 @@ fun LibraryScreen(vm: NovelViewModel, listState: LazyListState, onOpen: (String)
     progressFor?.let { uid ->
         vm.novel(uid)?.let { n -> ProgressDialog(n, onDismiss = { progressFor = null }, onSave = { vm.setRead(uid, it) }) }
     }
-    if (showRefreshAll) RefreshAllDialog(all, onDismiss = { showRefreshAll = false }, onStart = { skip, bg -> if (bg) vm.startRefreshAllInBackground(skip) else vm.startRefreshAll(skip); go("queue") })
+    if (showRefreshAll) RefreshAllDialog(all, refreshParallel, onParallelChange = { vm.setRefreshParallel(it) }, onDismiss = { showRefreshAll = false }, onStart = { skip, bg -> if (bg) vm.startRefreshAllInBackground(skip) else vm.startRefreshAll(skip); go("queue") })
     plan?.let { p -> ImportDialog(p, onCancel = { vm.cancelImport() }, onApply = { vm.applyImport(it) }) }
 }
 

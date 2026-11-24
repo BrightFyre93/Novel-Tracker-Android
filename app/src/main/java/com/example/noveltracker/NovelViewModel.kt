@@ -597,6 +597,14 @@ class NovelViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** How many novels a refresh works on at once (1 to 10). Saved; applies from the next run. */
+    val refreshParallel = MutableStateFlow(RefreshSettings.parallel(ctx))
+    fun setRefreshParallel(n: Int) {
+        val v = n.coerceIn(RefreshSettings.MIN, RefreshSettings.MAX)
+        refreshParallel.value = v
+        RefreshSettings.setParallel(ctx, v)
+    }
+
     fun resumeQueue() { requeue(QStatus.BLOCKED, QStatus.RUNNING); runQueue() }
     fun retryFailed() { requeue(QStatus.FAILED); runQueue() }
     fun retryOne(uid: String) { RefreshEngine.setItem(ctx, uid, QStatus.PENDING); runQueue() }

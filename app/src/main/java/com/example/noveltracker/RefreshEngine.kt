@@ -8,13 +8,19 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
 
 /** Short summary of what a refresh left for you to look at (queue rows, snackbars). */
@@ -24,6 +30,19 @@ fun refreshOutcome(n: Novel): String {
     val warn = n.issues().count { it.severity == Severity.WARN }
     if (warn > 0) parts.add("$warn data warning" + if (warn > 1) "s" else "")
     return parts.joinToString(", ")
+}
+
+/** How many novels a refresh works on at the same time (1 to 10). Applies from the next run. Saved in SharedPreferences. */
+object RefreshSettings {
+    const val MIN = 1
+    const val MAX = 10
+    private const val KEY = "refresh_parallel"
+
+    private fun prefs(ctx: Context) = ctx.getSharedPreferences("novel_tracker_prefs", Context.MODE_PRIVATE)
+
+    fun parallel(ctx: Context): Int = prefs(ctx).getInt(KEY, MIN).coerceIn(MIN, MAX)
+
+    fun setParallel(ctx: Context, n: Int) { prefs(ctx).edit().putInt(KEY, n.coerceIn(MIN, MAX)).apply() }
 }
 
 /**
@@ -59,6 +78,7 @@ object RefreshEngine {
         }
     }
 
+    @Synchronized
     private fun save(ctx: Context) {
         runCatching {
             val arr = JSONArray()
@@ -89,39 +109,71 @@ object RefreshEngine {
     fun requeue(ctx: Context, vararg from: QStatus) =
         mutate(ctx) { q -> q.copy(items = q.items.map { if (it.status in from) it.copy(status = QStatus.PENDING, note = "") else it }) }
 
+    /** Takes the first PENDING item and marks it RUNNING in one atomic step, so two workers never take the same one. */
+    private fun claimNext(ctx: Context): QItem? {
+        var claimed: QItem? = null
+        state.update { q ->
+            val i = q.items.indexOfFirst { it.status == QStatus.PENDING }
+            if (i < 0) { claimed = null; q }
+            else {
+                claimed = q.items[i]
+                q.copy(items = q.items.mapIndexed { j, item -> if (j == i) item.copy(status = QStatus.RUNNING, note = "") else item })
+            }
+        }
+        if (claimed != null) save(ctx)
+        return claimed
+    }
+
     /**
-     * Works through the PENDING items one by one with the usual pause between pages, saving every result to the library
-     * and every status change to disk. Stops at a bot check (that item becomes BLOCKED, the rest stay PENDING). Safe to
-     * cancel: an item that was RUNNING goes back to PENDING. If another runner is already active this returns at once.
+     * Works through the PENDING items, up to [RefreshSettings.parallel] novels at a time (the "Novels at a time" setting,
+     * 1 to 10), saving every result to the library and every status change to disk. Each worker pauses a little between
+     * novels. A bot check stops all workers from taking new items (that item becomes BLOCKED, the rest stay PENDING; pages
+     * already being fetched finish). Safe to cancel: items that were RUNNING go back to PENDING. If another runner is
+     * already active this returns at once.
      */
     suspend fun run(ctx: Context, store: NovelStore, scraper: Scraper, say: (String) -> Unit) {
         if (!runner.tryLock()) return
         try {
             mutate(ctx) { it.copy(running = true) }
             try {
-                while (true) {
-                    val next = state.value.items.firstOrNull { it.status == QStatus.PENDING } ?: break
-                    val n = store.novels.value.firstOrNull { it.uid == next.uid }
-                    if (n == null) { setItem(ctx, next.uid, QStatus.FAILED, "Removed from library"); continue }
-                    setItem(ctx, next.uid, QStatus.RUNNING)
-                    val r = scraper.fetch(n)
-                    store.editScraped(n.uid) { x ->
-                        val applied = x.applyScrape(r)
-                        // A novel added from a link starts with a title made from its page name; take the site's real title
-                        // once, and only if you haven't renamed it since and no other novel already has that title.
-                        val title = r.siteTitle
-                        if (next.renameOnSuccess && r.ok && title.isNotBlank() && title != x.name && x.name == placeholderName(x.slug) &&
-                            store.novels.value.none { it.uid != x.uid && it.key == nameKey(title) }
-                        ) applied.copy(name = title) else applied
+                val stop = AtomicBoolean(false)
+                coroutineScope {
+                    repeat(RefreshSettings.parallel(ctx)) { w ->
+                        launch {
+                            if (w > 0) delay(w * 400L) // don't start every page at the same instant
+                            while (!stop.get()) {
+                                val next = claimNext(ctx) ?: break
+                                val n = store.novels.value.firstOrNull { it.uid == next.uid }
+                                if (n == null) { setItem(ctx, next.uid, QStatus.FAILED, "Removed from library"); continue }
+                                val r = try {
+                                    withContext(Dispatchers.Default) { scraper.fetch(n) }
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    setItem(ctx, next.uid, QStatus.FAILED, "${FailKind.NETWORK.label} \u2014 ${e.message ?: e.javaClass.simpleName}")
+                                    continue
+                                }
+                                store.editScraped(n.uid) { x ->
+                                    val applied = x.applyScrape(r)
+                                    // A novel added from a link starts with a title made from its page name; take the site's real title
+                                    // once, and only if you haven't renamed it since and no other novel already has that title.
+                                    val title = r.siteTitle
+                                    if (next.renameOnSuccess && r.ok && title.isNotBlank() && title != x.name && x.name == placeholderName(x.slug) &&
+                                        store.novels.value.none { it.uid != x.uid && it.key == nameKey(title) }
+                                    ) applied.copy(name = title) else applied
+                                }
+                                if (r.blocked) {
+                                    setItem(ctx, next.uid, QStatus.BLOCKED, r.note)
+                                    if (stop.compareAndSet(false, true)) say("Bot check. Open Verify in browser, solve it, then Resume.")
+                                    break
+                                }
+                                if (r.ok) setItem(ctx, next.uid, QStatus.DONE, store.novels.value.firstOrNull { it.uid == n.uid }?.let { refreshOutcome(it) }.orEmpty())
+                                else setItem(ctx, next.uid, QStatus.FAILED, r.note)
+                                // pause between pages, not after the last one
+                                if (!stop.get() && state.value.items.any { it.status == QStatus.PENDING }) delay(1000L + Random.nextLong(1500))
+                            }
+                        }
                     }
-                    if (r.blocked) {
-                        setItem(ctx, next.uid, QStatus.BLOCKED, r.note)
-                        say("Bot check. Open Verify in browser, solve it, then Resume.")
-                        break
-                    }
-                    if (r.ok) setItem(ctx, next.uid, QStatus.DONE, store.novels.value.firstOrNull { it.uid == n.uid }?.let { refreshOutcome(it) }.orEmpty())
-                    else setItem(ctx, next.uid, QStatus.FAILED, r.note)
-                    if (state.value.items.any { it.status == QStatus.PENDING }) delay(1000L + Random.nextLong(1500)) // pause between pages, not after the last one
                 }
                 val q = state.value
                 if (q.count(QStatus.PENDING) == 0 && q.count(QStatus.BLOCKED) == 0) {
