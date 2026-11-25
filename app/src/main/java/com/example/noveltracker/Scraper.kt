@@ -149,8 +149,9 @@ object NovelParser {
     private fun normStatus(s: String): String {
         val t = s.lowercase()
         return when {
-            "complete" in t -> "Completed"
-            "ongoing" in t || "running" in t -> "Running"
+            // Ongoing is checked first so "Ongoing (not completed)" can't read as Completed; "incomplete" never counts as completed.
+            Regex("\\b(ongoing|on-going|running|updating|in progress)\\b").containsMatchIn(t) -> "Running"
+            Regex("\\b(completed?|finished|ended)\\b").containsMatchIn(t) && "incomplete" !in t -> "Completed"
             else -> s.trim()
         }
     }
@@ -295,13 +296,28 @@ class Scraper(ctx: Context) {
         }
         val ps = pages.values.toList()
         val bestTitle = ps.flatMap { it.titles }.maxByOrNull { similarity(n.name, it) }.orEmpty()
-        val statuses = ps.map { it.status }.filter { it.isNotBlank() }
+        // The novel's status follows the same rule as the chapter count: a source you chose (the preferred source) wins;
+        // otherwise, if the sites agree that is the status; if they disagree, the site with the higher chapter count is
+        // used, and a tie (or leaders that disagree too) stays "Running" instead of guessing "Completed".
+        val statusBySrc = pages.mapValues { it.value.status }.filterValues { it.isNotBlank() }
+        val siteStatus = when {
+            statusBySrc.isEmpty() -> ""
+            n.preferredSource in statusBySrc -> statusBySrc.getValue(n.preferredSource)
+            statusBySrc.values.distinct().size == 1 -> statusBySrc.values.first()
+            else -> {
+                val top = statusBySrc.keys.maxOf { pages.getValue(it).latest }
+                statusBySrc.filterKeys { pages.getValue(it).latest == top }.values.distinct().singleOrNull() ?: "Running"
+            }
+        }
+        if (statusBySrc.values.distinct().size > 1) {
+            notes.add("status differs (${statusBySrc.entries.joinToString { "${it.key}: ${it.value}" }}); using $siteStatus")
+        }
         return Scraped(
             ok = true, blocked = false, note = notes.joinToString("; "),
             counts = pages.mapValues { it.value.latest },
             titlesBySource = pages.mapValues { (_, p) -> p.titles.maxByOrNull { similarity(n.name, it) }.orEmpty() },
             statusBySource = pages.mapValues { it.value.status },
-            siteStatus = if ("Completed" in statuses) "Completed" else statuses.firstOrNull().orEmpty(),
+            siteStatus = siteStatus,
             siteTitle = bestTitle,
             author = ps.firstOrNull { it.author.isNotBlank() }?.author.orEmpty(),
             alt = ps.flatMap { it.alt }.distinctBy { it.lowercase() }.joinToString("; "),
